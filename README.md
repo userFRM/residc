@@ -137,10 +137,10 @@ cc -O2 -march=native -o bench bench/bench_compression.c core/residc.c -Icore && 
 
 | Message | Fields | Raw | Compressed | Ratio | Encode | Decode |
 |---------|--------|-----|------------|-------|--------|--------|
-| **Quote** (bid/ask update) | 5 | 19 B | 8.2 B | **2.32:1** | 56 ns | 45 ns |
-| **Trade** (execution report) | 8 | 35 B | 17.7 B | **1.97:1** | 99 ns | 74 ns |
-| **Order** (new order single) | 10 | 34 B | 14.7 B | **2.31:1** | 105 ns | 82 ns |
-| **Book Update** (L2 depth) | 7 | 21 B | 10.1 B | **2.08:1** | 73 ns | 56 ns |
+| **Quote** (bid/ask update) | 5 | 19 B | 7.9 B | **2.41:1** | 63 ns | 59 ns |
+| **Trade** (execution report) | 8 | 35 B | 17.2 B | **2.04:1** | 105 ns | 96 ns |
+| **Order** (new order single) | 10 | 34 B | 14.3 B | **2.38:1** | 118 ns | 110 ns |
+| **Book Update** (L2 depth) | 7 | 21 B | 9.5 B | **2.21:1** | 79 ns | 73 ns |
 
 Zero roundtrip errors across all message types. SDK bindings (Rust, Python) add FFI overhead (~40-70ns).
 
@@ -148,7 +148,7 @@ Zero roundtrip errors across all message types. SDK bindings (Rust, Python) add 
 
 | Codec | Ratio | Per-msg encode | Per-msg decode | Per-message? |
 |-------|-------|----------------|----------------|:------------:|
-| **residc** | **2-2.3:1** | **56 ns** | **45 ns** | Yes |
+| **residc** | **2-2.4:1** | **63 ns** | **59 ns** | Yes |
 | SBE / Cap'n Proto | 1.0:1 | ~10-25 ns | ~0 ns | Yes |
 | Protobuf | ~1.3:1 | ~100 ns | ~80 ns | Yes |
 | LZ4 (per-msg) | ~1.0:1 | ~50 ns | ~30 ns | Yes |
@@ -180,7 +180,7 @@ For each message, the codec:
 1. **Predicts** each field from synchronized encoder/decoder state
 2. **Computes the residual** (actual - predicted)
 3. **Zigzag-encodes** the signed residual to unsigned
-4. **Tiered-encodes** with an adaptive k parameter (small residuals = fewer bits)
+4. **Tiered-encodes** with adaptive k parameter and tight tier boundaries (k, k+2, k+5, k+10, 64-bit escape)
 5. **Updates state** identically on both sides
 
 Each compressed message is independently framed: `[1-byte length][payload]`. If compressed >= raw, a literal fallback is used (worst-case expansion: 1 byte).

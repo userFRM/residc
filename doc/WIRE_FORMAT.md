@@ -37,9 +37,9 @@ The core coding primitive. Encodes a zigzag-encoded unsigned value `zz` using a 
 | Tier | Prefix | Payload bits | Value range | Total bits |
 |------|--------|-------------|-------------|------------|
 | 0 | `0` | k | `0 .. 2^k - 1` | 1 + k |
-| 1 | `10` | k + 6 | `0 .. 2^(k+6) - 1` | 2 + k + 6 |
-| 2 | `110` | k + 12 | `0 .. 2^(k+12) - 1` | 3 + k + 12 |
-| 3 | `1110` | k + 20 | `0 .. 2^(k+20) - 1` | 4 + k + 20 |
+| 1 | `10` | k + 2 | `0 .. 2^(k+2) - 1` | 2 + k + 2 |
+| 2 | `110` | k + 5 | `0 .. 2^(k+5) - 1` | 3 + k + 5 |
+| 3 | `1110` | k + 10 | `0 .. 2^(k+10) - 1` | 4 + k + 10 |
 | 4 | `1111` | 64 (raw) | any 64-bit value | 4 + 64 |
 
 The decoder reads prefix bits one at a time until it finds a `0` bit (tiers 0-3) or reads `1111` (tier 4). For tier 4, the raw 64-bit signed value is written directly (not zigzag-encoded), split as two 32-bit writes (high then low).

@@ -155,15 +155,15 @@ void residc_encode_residual(residc_bitwriter_t *bw, int64_t value, int k)
     if (zz < (1ULL << k)) {
         residc_bw_write(bw, 0, 1);           /* tier 0: 0 + k bits */
         residc_bw_write(bw, zz, k);
-    } else if (zz < (1ULL << (k + 6))) {
+    } else if (zz < (1ULL << (k + 2))) {
         residc_bw_write(bw, 0x2, 2);         /* tier 1: 10 + (k+6) bits */
-        residc_bw_write(bw, zz, k + 6);
-    } else if (zz < (1ULL << (k + 12))) {
+        residc_bw_write(bw, zz, k + 2);
+    } else if (zz < (1ULL << (k + 5))) {
         residc_bw_write(bw, 0x6, 3);         /* tier 2: 110 + (k+12) bits */
-        residc_bw_write(bw, zz, k + 12);
-    } else if (zz < (1ULL << (k + 20))) {
+        residc_bw_write(bw, zz, k + 5);
+    } else if (zz < (1ULL << (k + 10))) {
         residc_bw_write(bw, 0xE, 4);         /* tier 3: 1110 + (k+20) bits */
-        residc_bw_write(bw, zz, k + 20);
+        residc_bw_write(bw, zz, k + 10);
     } else {
         residc_bw_write(bw, 0xF, 4);         /* tier 4: 1111 + 64 raw bits */
         residc_bw_write(bw, (uint64_t)value >> 32, 32);
@@ -180,17 +180,17 @@ int64_t residc_decode_residual(residc_bitreader_t *br, int k)
     }
     if (residc_br_read_bit(br) == 0) {
         /* tier 1 */
-        uint64_t zz = residc_br_read(br, k + 6);
+        uint64_t zz = residc_br_read(br, k + 2);
         return residc_zigzag_dec(zz);
     }
     if (residc_br_read_bit(br) == 0) {
         /* tier 2 */
-        uint64_t zz = residc_br_read(br, k + 12);
+        uint64_t zz = residc_br_read(br, k + 5);
         return residc_zigzag_dec(zz);
     }
     if (residc_br_read_bit(br) == 0) {
         /* tier 3 */
-        uint64_t zz = residc_br_read(br, k + 20);
+        uint64_t zz = residc_br_read(br, k + 10);
         return residc_zigzag_dec(zz);
     }
     /* tier 4: raw 64-bit */
@@ -207,15 +207,15 @@ void encode_residual(residc_bitwriter_t *bw, int64_t value, int k)
     if (zz < (1ULL << k)) {
         bw_write(bw, 0, 1);
         bw_write(bw, zz, k);
-    } else if (zz < (1ULL << (k + 6))) {
+    } else if (zz < (1ULL << (k + 2))) {
         bw_write(bw, 0x2, 2);
-        bw_write(bw, zz, k + 6);
-    } else if (zz < (1ULL << (k + 12))) {
+        bw_write(bw, zz, k + 2);
+    } else if (zz < (1ULL << (k + 5))) {
         bw_write(bw, 0x6, 3);
-        bw_write(bw, zz, k + 12);
-    } else if (zz < (1ULL << (k + 20))) {
+        bw_write(bw, zz, k + 5);
+    } else if (zz < (1ULL << (k + 10))) {
         bw_write(bw, 0xE, 4);
-        bw_write(bw, zz, k + 20);
+        bw_write(bw, zz, k + 10);
     } else {
         bw_write(bw, 0xF, 4);
         bw_write(bw, (uint64_t)value >> 32, 32);
@@ -230,13 +230,13 @@ int64_t decode_residual(residc_bitreader_t *br, int k)
         return residc_zigzag_dec(br_read(br, k));
     }
     if (br_read_bit(br) == 0) {
-        return residc_zigzag_dec(br_read(br, k + 6));
+        return residc_zigzag_dec(br_read(br, k + 2));
     }
     if (br_read_bit(br) == 0) {
-        return residc_zigzag_dec(br_read(br, k + 12));
+        return residc_zigzag_dec(br_read(br, k + 5));
     }
     if (br_read_bit(br) == 0) {
-        return residc_zigzag_dec(br_read(br, k + 20));
+        return residc_zigzag_dec(br_read(br, k + 10));
     }
     uint64_t hi = br_read(br, 32);
     uint64_t lo = br_read(br, 32);
@@ -473,17 +473,6 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
                                        k_timestamp(state->regime),
                                        k_timestamp(state->regime) + 10);
             encode_residual(bw, residual, k);
-
-            uint64_t zz = residc_zigzag_enc(residual);
-            residc_adaptive_update(&state->ts_adapt_sum,
-                                   &state->ts_adapt_count, zz);
-
-            /* Update EMA: ema = ema + (gap - ema) / 4 in Q16 */
-            int64_t gap_q16 = (int64_t)((uint64_t)gap << 16);
-            state->timestamp_gap_ema +=
-                (gap_q16 - state->timestamp_gap_ema) >> 2;
-            state->last_timestamp = ts;
-            state->last_timestamp_gap = (uint64_t)gap;
             break;
         }
 
@@ -529,18 +518,6 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
                 encode_residual(bw, residual, k);
             }
 
-            /* Regime tracking */
-            uint64_t abs_res = (uint64_t)(residual < 0 ? -(uint64_t)residual : (uint64_t)residual);
-            state->recent_abs_price_sum += (uint32_t)abs_res;
-            state->regime_counter++;
-            if (state->regime_counter >= RESIDC_REGIME_WINDOW) {
-                uint32_t avg = state->recent_abs_price_sum /
-                               RESIDC_REGIME_WINDOW;
-                state->regime = (avg > 30) ? RESIDC_REGIME_VOLATILE
-                                           : RESIDC_REGIME_CALM;
-                state->recent_abs_price_sum = 0;
-                state->regime_counter = 0;
-            }
             break;
         }
 
@@ -579,9 +556,6 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
                                        k_seqid(state->regime),
                                        k_seqid(state->regime) + 10);
             encode_residual(bw, delta, k);
-
-            uint64_t zz = residc_zigzag_enc(delta);
-            residc_adaptive_update(&fs->adapt_sum, &fs->adapt_count, zz);
             break;
         }
 
@@ -665,6 +639,22 @@ static void commit_state(residc_state_t *state, const residc_schema_t *schema,
         uint64_t val = read_field(msg, f->offset, f->size);
 
         switch (f->type) {
+        case RESIDC_TIMESTAMP: {
+            uint64_t ts = val;
+            int64_t gap = (int64_t)(ts - state->last_timestamp);
+            int64_t predicted_gap = state->timestamp_gap_ema >> 16;
+            if (predicted_gap < 0) predicted_gap = 0;
+            int64_t residual = gap - predicted_gap;
+            uint64_t zz = residc_zigzag_enc(residual);
+            residc_adaptive_update(&state->ts_adapt_sum,
+                                   &state->ts_adapt_count, zz);
+            int64_t gap_q16 = (int64_t)((uint64_t)gap << 16);
+            state->timestamp_gap_ema +=
+                (gap_q16 - state->timestamp_gap_ema) >> 2;
+            state->last_timestamp = ts;
+            state->last_timestamp_gap = (uint64_t)gap;
+            break;
+        }
         case RESIDC_INSTRUMENT:
             instrument_id = (uint16_t)val;
             is = (instrument_id < RESIDC_MAX_INSTRUMENTS)
@@ -677,16 +667,41 @@ static void commit_state(residc_state_t *state, const residc_schema_t *schema,
             }
             state->last_instrument_id = instrument_id;
             break;
-        case RESIDC_PRICE:
-            if (is) is->last_price = (uint32_t)val;
+        case RESIDC_PRICE: {
+            uint32_t price = (uint32_t)val;
+            uint32_t predicted = (is && is->msg_count > 0)
+                               ? is->last_price : 0;
+            int64_t residual = (int64_t)price - (int64_t)predicted;
+            uint64_t abs_res = (uint64_t)(residual < 0
+                ? -(uint64_t)residual : (uint64_t)residual);
+            state->recent_abs_price_sum += (uint32_t)abs_res;
+            state->regime_counter++;
+            if (state->regime_counter >= RESIDC_REGIME_WINDOW) {
+                uint32_t avg = state->recent_abs_price_sum /
+                               RESIDC_REGIME_WINDOW;
+                state->regime = (avg > 30) ? RESIDC_REGIME_VOLATILE
+                                           : RESIDC_REGIME_CALM;
+                state->recent_abs_price_sum = 0;
+                state->regime_counter = 0;
+            }
+            if (is) is->last_price = price;
             break;
+        }
         case RESIDC_QUANTITY:
             if (is) is->last_qty = (uint32_t)val;
             break;
-        case RESIDC_SEQUENTIAL_ID:
-            state->field_state[fi].last_value = val;
-            if (is) is->last_seq_id = val;
+        case RESIDC_SEQUENTIAL_ID: {
+            uint64_t id = val;
+            residc_field_state_t *fs = &state->field_state[fi];
+            uint64_t predicted = (is && is->last_seq_id > 0)
+                               ? is->last_seq_id : fs->last_value;
+            int64_t delta = (int64_t)(id - predicted);
+            uint64_t zz = residc_zigzag_enc(delta);
+            residc_adaptive_update(&fs->adapt_sum, &fs->adapt_count, zz);
+            fs->last_value = id;
+            if (is) is->last_seq_id = id;
             break;
+        }
         case RESIDC_ENUM:
         case RESIDC_CATEGORICAL:
             state->field_state[fi].last_value = val;
@@ -771,16 +786,6 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
             int64_t residual = decode_residual(br, k);
             int64_t gap = residual + predicted_gap;
             val = state->last_timestamp + (uint64_t)gap;
-
-            uint64_t zz = residc_zigzag_enc(residual);
-            residc_adaptive_update(&state->ts_adapt_sum,
-                                   &state->ts_adapt_count, zz);
-
-            int64_t gap_q16 = (int64_t)((uint64_t)gap << 16);
-            state->timestamp_gap_ema +=
-                (gap_q16 - state->timestamp_gap_ema) >> 2;
-            state->last_timestamp = val;
-            state->last_timestamp_gap = (uint64_t)gap;
             break;
         }
 
@@ -798,14 +803,6 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
             is = (instrument_id < RESIDC_MAX_INSTRUMENTS)
                  ? &state->instruments[instrument_id] : NULL;
             val = instrument_id;
-            /* Commit: MFU update + state */
-            residc_mfu_update(&state->mfu, instrument_id);
-            state->mfu_decay_counter++;
-            if (state->mfu_decay_counter >= 10000) {
-                mfu_decay(&state->mfu);
-                state->mfu_decay_counter = 0;
-            }
-            state->last_instrument_id = instrument_id;
             break;
         }
 
@@ -824,22 +821,6 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                 price = (uint32_t)((int64_t)predicted + residual);
             }
             val = price;
-
-            /* Regime tracking */
-            int64_t full_res = (int64_t)price - (int64_t)predicted;
-            uint64_t abs_res = (uint64_t)(full_res < 0 ? -(uint64_t)full_res : (uint64_t)full_res);
-            state->recent_abs_price_sum += (uint32_t)abs_res;
-            state->regime_counter++;
-            if (state->regime_counter >= RESIDC_REGIME_WINDOW) {
-                uint32_t avg = state->recent_abs_price_sum /
-                               RESIDC_REGIME_WINDOW;
-                state->regime = (avg > 30) ? RESIDC_REGIME_VOLATILE
-                                           : RESIDC_REGIME_CALM;
-                state->recent_abs_price_sum = 0;
-                state->regime_counter = 0;
-            }
-            /* Commit: price state */
-            if (is) is->last_price = price;
             break;
         }
 
@@ -849,7 +830,7 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
             int k = k_quantity(state->regime);
 
             if (br_read_bit(br) == 0) {
-                val = predicted;  /* same */
+                val = predicted;
             } else {
                 int mode = br_read_bit(br);
                 int64_t residual = decode_residual(br, k);
@@ -860,8 +841,6 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                     val = (uint32_t)((int64_t)predicted + residual);
                 }
             }
-            /* Commit: qty state */
-            if (is) is->last_qty = (uint32_t)val;
             break;
         }
 
@@ -874,12 +853,6 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                                        k_seqid(state->regime) + 10);
             int64_t delta = decode_residual(br, k);
             val = predicted + (uint64_t)delta;
-
-            uint64_t zz = residc_zigzag_enc(delta);
-            residc_adaptive_update(&fs->adapt_sum, &fs->adapt_count, zz);
-            /* Commit: seq state */
-            fs->last_value = val;
-            if (is) is->last_seq_id = val;
             break;
         }
 
@@ -890,8 +863,6 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
             } else {
                 val = br_read(br, f->size * 8);
             }
-            /* Commit: enum state */
-            fs->last_value = val;
             break;
         }
 
@@ -908,8 +879,6 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                 uint64_t lo = br_read(br, 16);
                 val = (hi << 16) | lo;
             }
-            /* Commit: categorical state */
-            fs->last_value = val;
             break;
         }
 
@@ -932,8 +901,6 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
             int k = k_seqid(state->regime);
             int64_t delta = decode_residual(br, k);
             val = ref_val + (uint64_t)delta;
-            /* Commit: delta id state */
-            state->field_state[fi].last_value = val;
             break;
         }
 
@@ -954,10 +921,6 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
 
         write_field(msg, f->offset, f->size, val);
     }
-
-    /* Finalize message-level counters */
-    if (is) is->msg_count++;
-    state->msg_count++;
 
     return 0;
 }
@@ -997,7 +960,7 @@ int residc_decode(residc_state_t *state, const uint8_t *in, int in_len,
     residc_br_init(&br, in + 1, payload_len);
 
     decode_fields(state, schema, &br, msg);
-    /* State committed inline during decode_fields */
+    commit_state(state, schema, msg);
 
     return 1 + payload_len;
 }
@@ -1143,7 +1106,7 @@ int residc_decode_multi(residc_state_t *state, const uint8_t *in, int in_len,
     *(uint8_t *)((uint8_t *)msg + multi->type_offset) = type_val;
 
     decode_fields(state, schema, &br, msg);
-    /* State committed inline during decode_fields */
+    commit_state(state, schema, msg);
     state->last_msg_type_index = (uint8_t)type_idx;
 
     return 1 + payload_len;
