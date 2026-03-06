@@ -4,7 +4,7 @@
  * Implementation of the core encoding/decoding engine.
  * See residc.h for API documentation and usage examples.
  *
- * License: MIT
+ * License: MIT OR Apache-2.0
  */
 
 #include "residc.h"
@@ -396,6 +396,43 @@ void residc_reset(residc_state_t *state)
     state->schema = s;
     state->multi_schema = m;
     residc_mfu_init(&state->mfu);
+}
+
+/* ================================================================
+ * State Checkpoint / Restore
+ * ================================================================ */
+
+void residc_snapshot(const residc_state_t *state, residc_state_t *snap)
+{
+    memcpy(snap, state, sizeof(*state));
+}
+
+void residc_restore(residc_state_t *state, const residc_state_t *snap)
+{
+    const residc_schema_t *s = state->schema;
+    const residc_multi_schema_t *m = state->multi_schema;
+    memcpy(state, snap, sizeof(*state));
+    state->schema = s;
+    state->multi_schema = m;
+}
+
+/* ================================================================
+ * MFU Pre-Seeding
+ * ================================================================ */
+
+void residc_mfu_seed(residc_mfu_table_t *mfu, const uint16_t *ids,
+                     const uint16_t *counts, int n)
+{
+    residc_mfu_init(mfu);
+    int to_add = n < RESIDC_MFU_SIZE ? n : RESIDC_MFU_SIZE;
+    for (int i = 0; i < to_add; i++) {
+        mfu->entries[i].instrument_id = ids[i];
+        mfu->entries[i].count = counts[i];
+        uint8_t h = (uint8_t)(ids[i] * 157);
+        mfu->chain[i] = mfu->hash[h];
+        mfu->hash[h] = (uint8_t)i;
+    }
+    mfu->num_entries = (uint8_t)to_add;
 }
 
 int residc_raw_size(const residc_schema_t *schema)

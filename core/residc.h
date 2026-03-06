@@ -491,6 +491,46 @@ void    residc_mfu_init(residc_mfu_table_t *mfu);
 int     residc_mfu_lookup(const residc_mfu_table_t *mfu, uint16_t id);
 void    residc_mfu_update(residc_mfu_table_t *mfu, uint16_t id);
 
+/* ================================================================
+ * State Checkpoint / Restore
+ *
+ * For gap recovery: snapshot codec state periodically, restore
+ * and replay from the snapshot if messages are lost.
+ * The snapshot is a full copy of the state struct (~330KB).
+ * ================================================================ */
+
+/*
+ * Take a snapshot of codec state.
+ * @param state  Source codec state
+ * @param snap   Destination (caller-allocated residc_state_t)
+ */
+void residc_snapshot(const residc_state_t *state, residc_state_t *snap);
+
+/*
+ * Restore codec state from a snapshot.
+ * Preserves the current schema/multi_schema pointers.
+ * @param state  Destination codec state (to restore into)
+ * @param snap   Source snapshot
+ */
+void residc_restore(residc_state_t *state, const residc_state_t *snap);
+
+/* ================================================================
+ * MFU Pre-Seeding
+ *
+ * Initialize the MFU table with known instruments for faster
+ * warm-up. Must be called identically on encoder and decoder.
+ * ================================================================ */
+
+/*
+ * Pre-seed the MFU table with known instrument frequencies.
+ * @param mfu     MFU table (from state->mfu)
+ * @param ids     Array of instrument IDs (sorted by descending frequency)
+ * @param counts  Array of frequency counts (parallel to ids)
+ * @param n       Number of entries (capped at RESIDC_MFU_SIZE)
+ */
+void residc_mfu_seed(residc_mfu_table_t *mfu, const uint16_t *ids,
+                     const uint16_t *counts, int n);
+
 #ifdef __cplusplus
 }
 #endif

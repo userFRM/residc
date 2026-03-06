@@ -237,6 +237,7 @@ impl FieldState {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Regime { Calm, Volatile }
 
+#[derive(Clone)]
 pub struct Codec {
     schema: Schema,
     msg_count: u64,
@@ -288,6 +289,32 @@ impl Codec {
         *self = Self::new(&self.schema);
     }
 
+    /// Take a snapshot of codec state for gap recovery.
+    ///
+    /// Snapshot periodically on the decoder side. If a gap is detected
+    /// (missing messages), restore the snapshot and replay from that point.
+    pub fn snapshot(&self) -> Self {
+        self.clone()
+    }
+
+    /// Restore codec state from a snapshot.
+    pub fn restore_from(&mut self, snap: &Self) {
+        let schema = self.schema.clone();
+        *self = snap.clone();
+        self.schema = schema;
+    }
+
+    /// Pre-seed the MFU table with known instrument frequencies.
+    ///
+    /// `instruments` is a slice of `(id, count)` pairs, sorted by descending
+    /// frequency. Must be called identically on encoder and decoder.
+    ///
+    /// This eliminates the warm-up period for instrument prediction,
+    /// giving better compression from the first message.
+    pub fn seed_mfu(&mut self, instruments: &[(u16, u32)]) {
+        self.mfu.seed(instruments);
+    }
+
     #[inline(always)]
     fn k_ts(&self) -> u32 {
         if self.regime == Regime::Volatile { 8 } else { 10 }
@@ -310,12 +337,20 @@ impl Codec {
 
     #[inline(always)]
     fn instrument_state(&self, id: u16) -> &InstrumentState {
+        debug_assert!(
+            (id as usize) < MAX_INSTRUMENTS,
+            "instrument ID {} exceeds MAX_INSTRUMENTS ({})", id, MAX_INSTRUMENTS
+        );
         // SAFETY: id is masked to MAX_INSTRUMENTS range
         unsafe { self.instruments.get_unchecked((id as usize) & (MAX_INSTRUMENTS - 1)) }
     }
 
     #[inline(always)]
     fn instrument_state_mut(&mut self, id: u16) -> &mut InstrumentState {
+        debug_assert!(
+            (id as usize) < MAX_INSTRUMENTS,
+            "instrument ID {} exceeds MAX_INSTRUMENTS ({})", id, MAX_INSTRUMENTS
+        );
         unsafe { self.instruments.get_unchecked_mut((id as usize) & (MAX_INSTRUMENTS - 1)) }
     }
 
@@ -782,6 +817,7 @@ impl Codec {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     #[test]
@@ -828,6 +864,139 @@ mod tests {
             }
         }
         assert_eq!(errors, 0, "roundtrip errors");
+    }
+
+    #[test]
+    fn snapshot_restore() {
+        // Each Codec is ~330KB; we need 4 instances, so use a larger stack
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let schema = Schema::builder()
+                    .field("timestamp", FieldType::Timestamp)
+                    .field("instrument", FieldType::Instrument)
+                    .field("price", FieldType::Price)
+                    .field("quantity", FieldType::Quantity)
+                    .field("side", FieldType::Bool)
+                    .build();
+
+                let mut enc = Codec::new(&schema);
+                let mut dec = Codec::new(&schema);
+
+                let mut ts = 34_200_000_000_000u64;
+                for i in 0..100u64 {
+                    ts += 1000 + (i * 37 % 50000);
+                    let msg = Message::new()
+                        .set(0, ts)
+                        .set(1, (i % 50) as u64)
+                        .set(2, (1_500_000 + (i * 7 % 2000)) as u64)
+                        .set(3, ((1 + i % 20) * 100) as u64)
+                        .set(4, (i % 2) as u64);
+                    let mut buf = [0u8; 64];
+                    let len = enc.encode(&msg, &mut buf).unwrap();
+                    dec.decode(&buf[..len]).unwrap();
+                }
+
+                // Snapshot after 100 messages
+                let enc_snap = enc.snapshot();
+                let dec_snap = dec.snapshot();
+
+                // Send 50 more (diverge from snapshot)
+                for i in 100..150u64 {
+                    ts += 1000 + (i * 37 % 50000);
+                    let msg = Message::new()
+                        .set(0, ts)
+                        .set(1, (i % 50) as u64)
+                        .set(2, (1_500_000 + (i * 7 % 2000)) as u64)
+                        .set(3, ((1 + i % 20) * 100) as u64)
+                        .set(4, (i % 2) as u64);
+                    let mut buf = [0u8; 64];
+                    let len = enc.encode(&msg, &mut buf).unwrap();
+                    dec.decode(&buf[..len]).unwrap();
+                }
+
+                // Restore and replay — must roundtrip perfectly
+                enc.restore_from(&enc_snap);
+                dec.restore_from(&dec_snap);
+
+                ts = 34_200_000_000_000u64;
+                for i in 0..100u64 {
+                    ts += 1000 + (i * 37 % 50000);
+                }
+                let mut errors = 0;
+                for i in 100..150u64 {
+                    ts += 1000 + (i * 37 % 50000);
+                    let msg = Message::new()
+                        .set(0, ts)
+                        .set(1, (i % 50) as u64)
+                        .set(2, (1_500_000 + (i * 7 % 2000)) as u64)
+                        .set(3, ((1 + i % 20) * 100) as u64)
+                        .set(4, (i % 2) as u64);
+                    let mut buf = [0u8; 64];
+                    let len = enc.encode(&msg, &mut buf).unwrap();
+                    let decoded = dec.decode(&buf[..len]).unwrap();
+                    if decoded.get(0) != ts || decoded.get(2) != (1_500_000 + (i * 7 % 2000)) as u64 {
+                        errors += 1;
+                    }
+                }
+                assert_eq!(errors, 0, "snapshot/restore roundtrip errors");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn mfu_seed() {
+        let schema = Schema::builder()
+            .field("timestamp", FieldType::Timestamp)
+            .field("instrument", FieldType::Instrument)
+            .field("price", FieldType::Price)
+            .field("quantity", FieldType::Quantity)
+            .field("side", FieldType::Bool)
+            .build();
+
+        // Seeded codec should compress instrument IDs better from the start
+        let mut enc_seeded = Codec::new(&schema);
+        let mut dec_seeded = Codec::new(&schema);
+        let mut enc_cold = Codec::new(&schema);
+        let mut dec_cold = Codec::new(&schema);
+
+        let mut seed = [(0u16, 0u32); 50];
+        for i in 0..50 {
+            seed[i] = (i as u16, 100 - i as u32);
+        }
+        enc_seeded.seed_mfu(&seed);
+        dec_seeded.seed_mfu(&seed);
+
+        let mut total_seeded = 0usize;
+        let mut total_cold = 0usize;
+        let mut ts = 34_200_000_000_000u64;
+
+        for i in 0..50u64 {
+            ts += 10000;
+            let msg = Message::new()
+                .set(0, ts)
+                .set(1, (i % 50) as u64)
+                .set(2, 1_500_000u64)
+                .set(3, 100u64)
+                .set(4, 0u64);
+
+            let mut buf = [0u8; 64];
+            let len = enc_seeded.encode(&msg, &mut buf).unwrap();
+            let decoded = dec_seeded.decode(&buf[..len]).unwrap();
+            assert_eq!(decoded.get(1), (i % 50) as u64);
+            total_seeded += len;
+
+            let mut buf2 = [0u8; 64];
+            let len2 = enc_cold.encode(&msg, &mut buf2).unwrap();
+            dec_cold.decode(&buf2[..len2]).unwrap();
+            total_cold += len2;
+        }
+
+        // Seeded should be at least as good (likely better for early messages)
+        assert!(total_seeded <= total_cold,
+            "seeded ({}) should be <= cold ({})", total_seeded, total_cold);
     }
 
     #[test]

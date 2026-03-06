@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 550" font-family="'Helvetica Neue', Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 590" font-family="'Helvetica Neue', Arial, sans-serif">
   <defs>
     <style>
       .title { font-size: 18px; font-weight: 600; fill: #1a1a2e; }
@@ -13,7 +13,7 @@
   </defs>
 
   <!-- Background -->
-  <rect width="800" height="550" fill="#fafbfc" rx="8"/>
+  <rect width="800" height="590" fill="#fafbfc" rx="8"/>
 
   <!-- Title -->
   <text x="400" y="30" text-anchor="middle" class="title">Total Delivery Time: SBE vs residc</text>
@@ -24,7 +24,7 @@
     <rect x="0" y="0" width="12" height="12" fill="#e74c3c" rx="2"/>
     <text x="18" y="11" class="legend-text">SBE (no compression, ~25 ns encode)</text>
     <rect x="300" y="0" width="12" height="12" fill="#2980b9" rx="2"/>
-    <text x="318" y="11" class="legend-text">residc (3x compression, ~52 ns encode + 39 ns decode)</text>
+    <text x="318" y="11" class="legend-text">residc (3x compression, ~49 ns encode + 42 ns decode)</text>
   </g>
 
   <!-- Chart area -->
@@ -59,7 +59,7 @@
     <!-- === 10 GbE (19B) === -->
     <!-- SBE: 25 + 15 = 40ns = 4.8px -->
     <rect x="0" y="22" width="4.8" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 52 + 5 + 39 = 96ns = 11.5px -->
+    <!-- residc: 49 + 5 + 42 = 96ns = 11.5px -->
     <rect x="0" y="38" width="11.5" height="14" fill="#2980b9" rx="2"/>
     <text x="18" y="33" class="bar-label-dark">40 ns</text>
     <text x="25" y="49" class="bar-label-dark">96 ns</text>
@@ -68,7 +68,7 @@
     <!-- === 1 GbE (19B) === -->
     <!-- SBE: 25 + 152 = 177ns = 21.2px -->
     <rect x="0" y="92" width="21.2" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 52 + 51 + 39 = 142ns = 17.0px -->
+    <!-- residc: 49 + 51 + 42 = 142ns = 17.0px -->
     <rect x="0" y="108" width="17.0" height="14" fill="#2980b9" rx="2"/>
     <text x="35" y="103" class="bar-label-dark">177 ns</text>
     <text x="31" y="119" class="bar-label-dark">142 ns</text>
@@ -77,7 +77,7 @@
     <!-- === 1 GbE (60B) === -->
     <!-- SBE: 25 + 480 = 505ns = 60.6px -->
     <rect x="0" y="162" width="60.6" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 52 + 160 + 39 = 251ns = 30.1px -->
+    <!-- residc: 49 + 160 + 42 = 251ns = 30.1px -->
     <rect x="0" y="178" width="30.1" height="14" fill="#2980b9" rx="2"/>
     <text x="74" y="173" class="bar-label-dark">505 ns</text>
     <text x="44" y="189" class="bar-label-dark">251 ns</text>
@@ -86,7 +86,7 @@
     <!-- === 100 Mbps WAN === -->
     <!-- SBE: 25 + 4800 = 4825ns = 579px -->
     <rect x="0" y="232" width="579" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 52 + 1600 + 39 = 1691ns = 202.9px -->
+    <!-- residc: 49 + 1600 + 42 = 1691ns = 202.9px -->
     <rect x="0" y="248" width="202.9" height="14" fill="#2980b9" rx="2"/>
     <text x="540" y="243" class="bar-label">4.8 us</text>
     <text x="170" y="259" class="bar-label-dark">1.7 us</text>
@@ -95,7 +95,7 @@
     <!-- === Multicast x10 (1GbE, 60B) === -->
     <!-- SBE: 25 + 10*480 = 4825ns = 579px -->
     <rect x="0" y="302" width="579" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 52 + 10*160 + 39 = 1691ns = 202.9px -->
+    <!-- residc: 49 + 10*160 + 42 = 1691ns = 202.9px -->
     <rect x="0" y="318" width="202.9" height="14" fill="#2980b9" rx="2"/>
     <text x="540" y="313" class="bar-label">4.8 us</text>
     <text x="170" y="329" class="bar-label-dark">1.7 us</text>
@@ -104,7 +104,7 @@
     <!-- === 10 Mbps (mobile/retail) === -->
     <!-- SBE: 25 + 48000 = 48025ns, capped at 600px -->
     <rect x="0" y="372" width="600" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 52 + 16000 + 39 = 16091ns, capped at 200px -->
+    <!-- residc: 49 + 16000 + 42 = 16091ns, capped at 200px -->
     <rect x="0" y="388" width="200" height="14" fill="#2980b9" rx="2"/>
     <text x="555" y="383" class="bar-label">48 us</text>
     <text x="165" y="399" class="bar-label-dark">16 us</text>
@@ -112,5 +112,5 @@
   </g>
 
   <!-- Bottom note -->
-  <text x="400" y="540" text-anchor="middle" class="subtitle">Wire time = message_size * 8 / link_speed. SBE sends raw; residc sends ~3x smaller.</text>
+  <text x="400" y="575" text-anchor="middle" class="subtitle">Wire time = message_size * 8 / link_speed. SBE sends raw; residc sends ~3x smaller.</text>
 </svg>

@@ -113,6 +113,21 @@ impl MfuTable {
         }
     }
 
+    /// Pre-seed the table with known instruments.
+    /// `instruments` is a slice of (id, count) pairs, sorted by descending frequency.
+    /// Must be called identically on encoder and decoder.
+    pub fn seed(&mut self, instruments: &[(u16, u32)]) {
+        *self = Self::new();
+        let n = instruments.len().min(MFU_SIZE);
+        for i in 0..n {
+            let (id, count) = instruments[i];
+            self.entries[i] = MfuEntry { id, count };
+            let h = Self::hash_of(id);
+            self.hash[h] = i as u8;
+        }
+        self.len = n;
+    }
+
     /// Halve all counts (periodic decay to adapt to changing instrument mix).
     pub fn decay(&mut self) {
         for i in 0..self.len {

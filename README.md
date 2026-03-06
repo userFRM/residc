@@ -2,7 +2,7 @@
 
 **Schema-driven, per-message prediction-residual compression for financial data.**
 
-residc compresses financial messages (quotes, orders, trades) **3-4x** by predicting each field from context and encoding only the prediction error. Unlike general-purpose compressors (LZ4, zstd), it works on individual messages -- no blocks, no buffering, per-message random access.
+residc compresses financial messages (quotes, orders, trades) **2-3x** by predicting each field from context and encoding only the prediction error. Unlike general-purpose compressors (LZ4, zstd), it works on individual messages -- no blocks, no buffering, per-message random access.
 
 Structure-agnostic: you define any message struct, map fields to prediction types, and the codec handles the rest.
 
@@ -19,12 +19,12 @@ Orders        43.7 B   13.4 B     3.26:1      0     (2M synthetic order flow)
 
 ### Latency
 
-|  | C (gcc -O2, 100K quotes) | Rust (--release, LTO, 100K quotes) |
-|--|--------------------------|-------------------------------------|
-| Encode | **51 ns/msg** | **52 ns/msg** |
-| Decode | 46 ns/msg | **39 ns/msg** |
+|  | C (gcc -O2, best of 10) | Rust (criterion mean, --release LTO) |
+|--|--------------------------|--------------------------------------|
+| Encode | **51 ns/msg** | **49 ns/msg** |
+| Decode | 48 ns/msg | **42 ns/msg** |
 
-Both implementations use `always_inline` / `#[inline(always)]` on the entire hot path. Rust achieves parity on encode and is faster on decode through hash-accelerated MFU lookup, direct-write BitWriter (no intermediate buffer), and single-pass encode+commit.
+Measured on 5-field synthetic quotes (100K messages). C uses `clock_gettime` best-of-10; Rust uses criterion statistical analysis (100 samples). Both compiled with `-march=native` / `target-cpu=native`.
 
 ## Comparison to Alternatives
 
@@ -32,12 +32,13 @@ Both implementations use `always_inline` / `#[inline(always)]` on the entire hot
 
 | Codec | Ratio (ITCH) | Encode | Decode | Per-msg | Approach |
 |-------|-------------|--------|--------|---------|----------|
-| **residc** | **3.27:1** | **51 ns** | **39 ns** | Yes | Prediction-residual |
-| SBE | 1.00:1 | ~25 ns | ~0 ns | Yes | Zero-copy cast, no compression |
+| **residc** | **3.27:1** | **49 ns** | **42 ns** | Yes | Prediction-residual |
+| SBE | 1.00:1 | ~25 ns | ~0 ns | Yes | Zero-copy struct overlay, no compression |
+| rkyv | 1.00:1 | ~10 ns | ~0 ns | Yes | Zero-copy archived structs, no compression |
+| Cap'n Proto | 1.00:1 | ~10 ns | ~0 ns | Yes | Zero-copy builder, no compression |
+| FlatBuffers | 1.00:1 | ~15 ns | ~0 ns | Yes | Zero-copy + offset tables, no compression |
 | FAST (FIX) | 2-4:1 | ~200 ns | ~200 ns | Yes | Template delta + stop-bit coding |
-| Protobuf | ~1.3:1 | ~150 ns | ~120 ns | Yes | Varint, no cross-message state |
-| Cap'n Proto | 1.00:1 | ~10 ns | ~0 ns | Yes | Zero-copy, no compression |
-| FlatBuffers | 1.00:1 | ~15 ns | ~0 ns | Yes | Zero-copy, no compression |
+| Protobuf | ~1.3:1 | ~100 ns | ~80 ns | Yes | Varint, no cross-message state |
 | LZ4 per-msg | 1.02:1 | ~50 ns | ~30 ns | Yes | Byte-sequence matching (too small) |
 
 ### Block codecs (different trade-off: no random access)
@@ -52,13 +53,13 @@ Both implementations use `always_inline` / `#[inline(always)]` on the entire hot
 
 | Scenario | Best choice | Why |
 |----------|------------|-----|
-| Same-rack ultra-low-latency (FPGA, kernel bypass) | SBE / Cap'n Proto | 25ns encode, bandwidth is free |
+| Same-rack ultra-low-latency (FPGA, kernel bypass) | SBE / rkyv / Cap'n Proto | ~10-25ns encode, bandwidth is free |
 | WAN market data distribution | **residc** | 3x smaller = 3x more throughput, wire time dominates |
 | Cloud / multi-region feeds | **residc** | Bandwidth costs money, latency budget is microseconds |
 | Multicast to N consumers | **residc** | Compression paid once, wire savings multiplied N times |
 | Historical data storage | **residc** + block compressor | Per-message access + block-level ratio |
 | Cross-datacenter replication | **residc** | Every byte costs on leased lines |
-| Mobile / retail data delivery | **residc** | 30:1 on text vs raw, enables cheap data products |
+| Mobile / retail data delivery | **residc** | 2-3x compression, lower bandwidth costs |
 
 ### Total delivery time: residc vs SBE
 
@@ -68,11 +69,11 @@ SBE is faster to encode but sends larger messages. The real metric is **end-to-e
 
 | Link | SBE total | residc total | Winner |
 |------|----------|-------------|--------|
-| 10 GbE, 19B msg | 25ns + 15ns = **40ns** | 52ns + 5ns + 39ns = **96ns** | SBE |
-| 1 GbE, 19B msg | 25ns + 152ns = **177ns** | 52ns + 51ns + 39ns = **142ns** | **residc** |
-| 1 GbE, 60B msg | 25ns + 480ns = **505ns** | 52ns + 160ns + 39ns = **251ns** | **residc** |
-| 100 Mbps WAN | 25ns + 4.8us = **4.8us** | 52ns + 1.6us + 39ns = **1.7us** | **residc** |
-| Multicast x10, 1GbE | 25ns + 10*480ns = **4.8us** | 52ns + 10*160ns + 39ns = **1.7us** | **residc** |
+| 10 GbE, 19B msg | 25ns + 15ns = **40ns** | 49ns + 5ns + 42ns = **96ns** | SBE |
+| 1 GbE, 19B msg | 25ns + 152ns = **177ns** | 49ns + 51ns + 42ns = **142ns** | **residc** |
+| 1 GbE, 60B msg | 25ns + 480ns = **505ns** | 49ns + 160ns + 42ns = **251ns** | **residc** |
+| 100 Mbps WAN | 25ns + 4.8us = **4.8us** | 49ns + 1.6us + 42ns = **1.7us** | **residc** |
+| Multicast x10, 1GbE | 25ns + 10*480ns = **4.8us** | 49ns + 10*160ns + 42ns = **1.7us** | **residc** |
 
 **The crossover point is ~1 GbE.** Above that, SBE wins on encode speed. Below that, residc wins because 3x smaller messages travel 3x faster on the wire. For data distribution — where vendors serve thousands of consumers over WAN, cloud, or multicast — the compression pays for itself many times over.
 
@@ -94,8 +95,8 @@ FAST (FIX Adapted for STreaming) was the FIX Trading Community's answer to this 
 | Dependencies | 0 | 0 |
 | `no_std` | N/A | Yes |
 | Heap allocations | 0 | 0 |
-| Encode latency | 51 ns | **52 ns** |
-| Decode latency | 46 ns | **39 ns** |
+| Encode latency | 51 ns | **49 ns** |
+| Decode latency | 48 ns | **42 ns** |
 
 ## Quick Start (C)
 
@@ -211,6 +212,78 @@ Each compressed message is independently framed: `[1-byte length][payload]`. If 
 
 Encoder and decoder run on different machines. They stay synchronized through identical state evolution -- both compute the same predictions from the same message stream. No shared memory, no coordination protocol. The wire carries only compressed frames.
 
+## Gap Recovery (State Checkpoint)
+
+If messages are lost in transit, encoder and decoder state diverges. To recover:
+
+1. **Snapshot** decoder state periodically (e.g., every N messages)
+2. **Detect** the gap (sequence number jump, transport-layer notification)
+3. **Restore** the snapshot and **replay** from that point
+
+```c
+// C
+residc_state_t checkpoint;
+residc_snapshot(&decoder, &checkpoint);  // periodically
+
+// ... gap detected ...
+residc_restore(&decoder, &checkpoint);   // restore
+// replay messages from checkpoint onwards
+```
+
+```rust
+// Rust
+let checkpoint = decoder.snapshot();     // periodically
+
+// ... gap detected ...
+decoder.restore_from(&checkpoint);       // restore
+// replay messages from checkpoint onwards
+```
+
+The snapshot is a full copy of the codec state (~330KB). For most applications, snapshotting every 1000-10000 messages balances recovery speed vs memory overhead.
+
+## MFU Pre-Seeding
+
+By default, the MFU (Most-Frequently-Used) instrument table starts empty and learns from the message stream. If you know the instrument distribution ahead of time, pre-seed it for better compression from message 1:
+
+```c
+// C — seed with top instruments by frequency
+uint16_t ids[]    = { 42, 99, 7, 101, 55 };
+uint16_t counts[] = { 500, 300, 200, 150, 100 };
+residc_mfu_seed(&encoder.mfu, ids, counts, 5);
+residc_mfu_seed(&decoder.mfu, ids, counts, 5);  // must match
+```
+
+```rust
+// Rust
+let seed = [(42, 500), (99, 300), (7, 200), (101, 150), (55, 100)];
+encoder.seed_mfu(&seed);
+decoder.seed_mfu(&seed);  // must match
+```
+
+## SDK (C-based, cross-language)
+
+The SDK wraps the C core into an opaque-handle API suitable for FFI bindings:
+
+```bash
+cd sdk
+make              # builds libresdc.so and libresdc.a
+```
+
+### Python
+
+```python
+from residc import Codec, TIMESTAMP, INSTRUMENT, PRICE, QUANTITY, BOOL
+
+enc = Codec([TIMESTAMP, INSTRUMENT, PRICE, QUANTITY, BOOL])
+dec = Codec([TIMESTAMP, INSTRUMENT, PRICE, QUANTITY, BOOL])
+
+data = enc.encode([34200000000000, 42, 1500250, 100, 0])
+values = dec.decode(data)
+assert values == [34200000000000, 42, 1500250, 100, 0]
+```
+
+The Python SDK uses ctypes with zero dependencies. See `sdk/python/example.py` for a complete example.
+
 ## Building
 
 ### C
@@ -225,7 +298,7 @@ cc -O2 -o quote_example examples/custom/quote_example.c core/residc.c -Icore
 
 ```bash
 cd rust
-cargo test     # 14 tests
+cargo test     # 16 tests
 cargo bench    # criterion benchmarks
 ```
 

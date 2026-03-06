@@ -157,15 +157,17 @@ If a message is lost (detected by sequence number gap), the receiver requests re
 
 ### NASDAQ ITCH 5.0 (8M real messages)
 
-| Metric | C (gcc -O2) | Rust (--release, LTO) |
-|--------|------------|----------------------|
-| Messages | 100,000 (synthetic) | 100,000 (synthetic) |
+| Metric | C (gcc -O2, best of 10) | Rust (criterion mean) |
+|--------|------------------------|----------------------|
+| Messages | 100,000 (synthetic) | 10,000 (synthetic) |
 | Ratio | 2.71:1 | 2.37:1 |
-| Encode latency | 51 ns/msg | **52 ns/msg** |
-| Decode latency | 46 ns/msg | **39 ns/msg** |
+| Encode latency | 51 ns/msg | **49 ns/msg** |
+| Decode latency | 48 ns/msg | **42 ns/msg** |
 | Roundtrip errors | 0 | 0 |
 
-Both implementations use `always_inline` / `#[inline(always)]` on the entire hot path. The Rust implementation additionally uses hash-accelerated MFU lookup, direct-write BitWriter (zero intermediate buffer), and single-pass encode+commit. On real NASDAQ ITCH 5.0 data (8M messages, 32B avg), the C codec achieves 3.27:1 compression.
+C uses `clock_gettime` best-of-10; Rust uses criterion statistical analysis (100 samples). Both compiled with `-march=native` / `target-cpu=native`. On real NASDAQ ITCH 5.0 data (8M messages, 32B avg), the C codec achieves 3.27:1 compression.
+
+**Note:** The C and Rust implementations use different wire formats and are not interoperable. Each is self-consistent (encoder ↔ decoder within the same implementation). The [C SDK](../sdk/) provides the canonical wire format with cross-language bindings.
 
 ### Compression breakdown by technique
 
@@ -201,7 +203,7 @@ On the same ITCH data:
 
 - **SBE** (Simple Binary Encoding): Fixed-layout binary encoding with zero compression. ~25ns encode via pointer cast. Industry standard for order entry at CME, Euronext, LSE. Optimal when bandwidth is unlimited (same-rack colo). residc complements SBE for bandwidth-constrained paths where 3x compression reduces total delivery time.
 
-- **Cap'n Proto / FlatBuffers**: Zero-copy serialization formats. ~10-15ns encode, no compression. Similar trade-off to SBE: fastest possible encode, no size reduction.
+- **rkyv / Cap'n Proto / FlatBuffers**: Zero-copy serialization formats. ~10-15ns encode, ~0ns deserialize (pointer cast). No compression. rkyv is the Rust-native option with the smallest overhead. Same trade-off as SBE: fastest possible encode, no size reduction. See [rust_serialization_benchmark](https://github.com/djkoloski/rust_serialization_benchmark) for comparative numbers.
 
 - **Protocol Buffers**: Schema-driven serialization with varint encoding. ~1.3:1 on financial data. No cross-message prediction, no domain-specific strategies. Designed for general-purpose RPC, not financial streaming.
 
@@ -215,10 +217,20 @@ On the same ITCH data:
 
 - **Higher encode latency than SBE**: SBE achieves ~25ns through zero-copy pointer cast. residc is ~51ns (C) / ~52ns (Rust) due to prediction + bit-level coding. On 10GbE same-rack links where bandwidth is free, SBE delivers lower total latency.
 
-- **State dependency**: Messages must be decoded in order from a known state. Loss of a single message desynchronizes encoder and decoder. Recovery requires retransmission from last known-good state or full state reset. This is inherent to any streaming prediction approach (same limitation as FAST Protocol).
+- **State dependency**: Messages must be decoded in order from a known state. Loss of a single message desynchronizes encoder and decoder. The `residc_snapshot()` / `residc_restore()` API enables checkpoint-based recovery: snapshot periodically, restore on gap detection, replay from the checkpoint. This is inherent to any streaming prediction approach (same limitation as FAST Protocol).
 
 - **Memory footprint**: ~330KB per codec instance (16,384 instrument state slots + MFU table + field state). Configurable via `MAX_INSTRUMENTS` constant.
 
 - **Domain-specific**: The prediction strategies assume financial data patterns (quasi-periodic timestamps, Zipf instrument distribution, mean-reverting prices, sequential IDs). Applying to non-financial domains would require different field types.
 
 - **Schema agreement**: Both encoder and decoder must use the same schema. Schema evolution requires explicit versioning or negotiation.
+
+## 8. Security Considerations
+
+- **Trusted input assumed**: residc assumes the compressed stream comes from a cooperating encoder. The decoder does not validate that decoded values are semantically valid (e.g., instrument IDs within expected range). Callers should validate decoded messages if the transport is untrusted.
+
+- **Instrument ID range**: Instrument IDs are used to index into a fixed-size array (`MAX_INSTRUMENTS = 16384`). The C implementation disables per-instrument prediction for out-of-range IDs (no crash, degraded compression). The Rust implementation masks IDs to the array size with `debug_assert!` in debug builds. Callers should ensure instrument IDs are within range.
+
+- **No authentication**: residc provides compression, not integrity. Combine with TLS, HMAC, or other authentication mechanisms for untrusted transports.
+
+- **Fuzzing**: The Rust implementation includes cargo-fuzz targets (`roundtrip` and `decode_arbitrary`) for continuous verification of roundtrip correctness and decode robustness against arbitrary input.

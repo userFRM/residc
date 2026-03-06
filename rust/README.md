@@ -2,16 +2,18 @@
 
 `#![no_std]`, zero-dependency, zero-allocation prediction-residual codec for financial data.
 
-Same wire format as the C library. A message encoded by C can be decoded by Rust and vice versa. Encoder and decoder can run on different machines — they stay synchronized through identical state evolution, no shared memory needed.
+**Note:** The Rust and C implementations use different wire formats and are not interoperable. Each implementation is self-consistent (encoder ↔ decoder within the same implementation works perfectly). For cross-language interop, use the [C SDK](../sdk/) which provides bindings for Python and other languages.
+
+Encoder and decoder can run on different machines — they stay synchronized through identical state evolution, no shared memory needed.
 
 ## Performance
 
-Measured on synthetic quote data (5 fields: timestamp, instrument, price, quantity, side), 100,000 messages, best of 10 iterations, `--release` with LTO + `target-cpu=native`.
+Measured on synthetic quote data (5 fields: timestamp, instrument, price, quantity, side), `--release` with LTO + `target-cpu=native`.
 
-| Metric | Value |
-|--------|-------|
-| Encode latency | **52 ns/msg** |
-| Decode latency | **39 ns/msg** |
+| Metric | Value | Method |
+|--------|-------|--------|
+| Encode latency | **49 ns/msg** | criterion mean (100 samples) |
+| Decode latency | **42 ns/msg** | criterion mean (100 samples) |
 | Compression ratio | 2.37:1 (19 bytes raw -> ~8 bytes compressed) |
 | Encode throughput | 365 MB/s |
 | Decode throughput | 487 MB/s |
@@ -22,12 +24,12 @@ Measured on synthetic quote data (5 fields: timestamp, instrument, price, quanti
 
 ### vs C implementation
 
-| | C (gcc -O2) | Rust (--release, LTO) |
-|--|------------|----------------------|
-| Encode | 51 ns/msg | **52 ns/msg** |
-| Decode | 46 ns/msg | **39 ns/msg** |
+| | C (gcc -O2, best of 10) | Rust (criterion mean) |
+|--|------------------------|----------------------|
+| Encode | 51 ns/msg | **49 ns/msg** |
+| Decode | 48 ns/msg | **42 ns/msg** |
 
-Parity on encode, faster on decode. Rust uses hash-accelerated MFU lookup, direct-write BitWriter, and single-pass encode+commit.
+Comparable performance. Rust uses hash-accelerated MFU lookup, direct-write BitWriter, and single-pass encode+commit.
 
 ### vs SBE total delivery time
 
@@ -35,9 +37,9 @@ SBE encodes in ~25ns (pointer cast, zero compression) but sends full-size messag
 
 | Link | SBE (encode + wire) | residc (encode + wire + decode) | Winner |
 |------|--------------------|---------------------------------|--------|
-| 10 GbE, 19B msg | 25ns + 15ns = **40ns** | 52ns + 5ns + 39ns = **96ns** | SBE |
-| 1 GbE, 60B msg | 25ns + 480ns = **505ns** | 52ns + 160ns + 39ns = **251ns** | residc |
-| 100 Mbps WAN | 25ns + 4.8us = **4.8us** | 52ns + 1.6us + 39ns = **1.7us** | residc |
+| 10 GbE, 19B msg | 25ns + 15ns = **40ns** | 49ns + 5ns + 42ns = **96ns** | SBE |
+| 1 GbE, 60B msg | 25ns + 480ns = **505ns** | 49ns + 160ns + 42ns = **251ns** | residc |
+| 100 Mbps WAN | 25ns + 4.8us = **4.8us** | 49ns + 1.6us + 42ns = **1.7us** | residc |
 | Multicast (N consumers) | N * 480ns wire | N * 160ns wire | residc |
 
 SBE wins in same-rack ultra-low-latency setups where bandwidth is free. residc wins everywhere bandwidth costs — WAN, cloud, data distribution, multicast, congested links.
@@ -85,4 +87,4 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release --example bench_raw
 cargo test
 ```
 
-15 tests: bit I/O (5), MFU table (4), zigzag + tiered residual coding (3), full encode/decode roundtrip (1K messages), compression ratio (10K messages), doctest.
+16 tests: bit I/O (5), MFU table (4), zigzag + tiered residual coding (3), full encode/decode roundtrip (1K messages), compression ratio (10K messages), snapshot/restore, MFU seed, doctest.
