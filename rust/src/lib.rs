@@ -233,9 +233,6 @@ pub struct Codec {
     // Per-instrument
     instruments: Vec<InstrumentState>,
 
-    // Last message type index (for multi-type, reserved)
-    #[allow(dead_code)]
-    last_type_index: u8,
 }
 
 impl Codec {
@@ -257,7 +254,6 @@ impl Codec {
             instruments: (0..MAX_INSTRUMENTS)
                 .map(|_| InstrumentState::default())
                 .collect(),
-            last_type_index: 0,
         }
     }
 
@@ -330,9 +326,7 @@ impl Codec {
         Ok(total)
     }
 
-    #[allow(unused_assignments)]
     fn encode_fields(&self, msg: &Message, bw: &mut bits::BitWriter) {
-        let mut instrument_id = self.last_instrument;
         let mut is: Option<&InstrumentState> = None;
 
         for (fi, fd) in self.schema.fields.iter().enumerate() {
@@ -353,21 +347,21 @@ impl Codec {
                 }
 
                 FieldType::Instrument => {
-                    instrument_id = val as u16;
-                    is = self.instrument_state(instrument_id);
+                    let id = val as u16;
+                    is = self.instrument_state(id);
 
-                    if instrument_id == self.last_instrument && self.msg_count > 0 {
+                    if id == self.last_instrument && self.msg_count > 0 {
                         bw.write(0, 1);
                     } else {
                         bw.write(1, 1);
-                        match self.mfu.lookup(instrument_id) {
+                        match self.mfu.lookup(id) {
                             Some(idx) => {
                                 bw.write(0, 1);
                                 bw.write(idx as u64, MFU_INDEX_BITS);
                             }
                             None => {
                                 bw.write(1, 1);
-                                bw.write(instrument_id as u64, 14);
+                                bw.write(id as u64, 14);
                             }
                         }
                     }
@@ -512,9 +506,7 @@ impl Codec {
         Ok(msg)
     }
 
-    #[allow(unused_assignments)]
     fn decode_fields(&self, br: &mut bits::BitReader, msg: &mut Message) {
-        let mut instrument_id = self.last_instrument;
         let mut is: Option<&InstrumentState> = None;
 
         for (fi, fd) in self.schema.fields.iter().enumerate() {
@@ -531,16 +523,16 @@ impl Codec {
                 }
 
                 FieldType::Instrument => {
-                    if br.read_bit() == 0 {
-                        instrument_id = self.last_instrument;
+                    let id = if br.read_bit() == 0 {
+                        self.last_instrument
                     } else if br.read_bit() == 0 {
                         let idx = br.read(MFU_INDEX_BITS) as usize;
-                        instrument_id = self.mfu.entries[idx].id;
+                        self.mfu.entries[idx].id
                     } else {
-                        instrument_id = br.read(14) as u16;
-                    }
-                    is = self.instrument_state(instrument_id);
-                    instrument_id as u64
+                        br.read(14) as u16
+                    };
+                    is = self.instrument_state(id);
+                    id as u64
                 }
 
                 FieldType::Price => {
