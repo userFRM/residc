@@ -25,12 +25,12 @@ ITCH 5.0      32.2 B    9.9 B     3.27:1      0     (8M real NASDAQ messages)
 
 ### Latency
 
-|  | C (gcc -O2, best of 10) | Rust (criterion mean, --release LTO) |
-|--|--------------------------|--------------------------------------|
-| Encode | **51 ns/msg** | **49 ns/msg** |
-| Decode | 48 ns/msg | **42 ns/msg** |
+|  | C core (gcc -O2, best of 10) |
+|--|------------------------------|
+| Encode | **51 ns/msg** |
+| Decode | **39 ns/msg** |
 
-Measured on 5-field synthetic quotes (100K messages). C uses `clock_gettime` best-of-10; Rust uses criterion statistical analysis (100 samples). Both compiled with `-march=native` / `target-cpu=native`.
+Measured on 5-field synthetic quotes (100K messages), `clock_gettime` best-of-10, `-march=native`. The Rust and Python SDKs add FFI call overhead (~40-70ns) on top of the C core.
 
 ## When to Use residc
 
@@ -38,7 +38,7 @@ residc fills the gap between zero-copy serializers (SBE, rkyv, Cap'n Proto) that
 
 | Codec | Ratio | Encode | Decode | Per-msg |
 |-------|-------|--------|--------|---------|
-| **residc** | **2-3:1** | **49 ns** | **42 ns** | Yes |
+| **residc** | **2-3:1** | **51 ns** | **39 ns** | Yes |
 | SBE / rkyv / Cap'n Proto | 1.0:1 | ~10-25 ns | ~0 ns | Yes |
 | Protobuf | ~1.3:1 | ~100 ns | ~80 ns | Yes |
 | LZ4 (per-msg) | ~1.0:1 | ~50 ns | ~30 ns | Yes |
@@ -48,17 +48,13 @@ residc fills the gap between zero-copy serializers (SBE, rkyv, Cap'n Proto) that
 
 ## Implementations
 
-> **Note:** The C and Rust implementations use different wire formats and are not interoperable. The C implementation is the canonical wire format, used by the SDK. See [Wire Format Specification](doc/WIRE_FORMAT.md).
+The C core is the single canonical implementation. Language SDKs wrap it via FFI. See [Wire Format Specification](doc/WIRE_FORMAT.md).
 
-| | C | Rust |
-|--|---|------|
-| Files | `core/residc.h` + `core/residc.c` | `rust/src/` (4 modules) |
-| Lines | 1,661 | 1,591 (1,194 without tests) |
-| Dependencies | 0 | 0 |
-| `no_std` | N/A | Yes |
-| Heap allocations | 0 | 0 |
-| Encode latency | 51 ns | **49 ns** |
-| Decode latency | 48 ns | **42 ns** |
+| | C core | Rust SDK | Python SDK |
+|--|--------|----------|------------|
+| Path | `core/` | `rust/` | `sdk/python/` |
+| Mechanism | Direct | FFI via `cc` crate | FFI via ctypes |
+| Dependencies | 0 | cc (build only) | 0 |
 
 ## Quick Start (C)
 
@@ -103,30 +99,23 @@ residc_decode(&dec, buf, len, &decoded);
 ## Quick Start (Rust)
 
 ```rust
-use residc::{Schema, FieldType, Codec, Message};
+use residc::{Codec, FieldType};
 
-let schema = Schema::builder()
-    .field("timestamp", FieldType::Timestamp)
-    .field("instrument", FieldType::Instrument)
-    .field("price", FieldType::Price)
-    .field("quantity", FieldType::Quantity)
-    .field("side", FieldType::Bool)
-    .build();
+let fields = &[
+    FieldType::Timestamp,
+    FieldType::Instrument,
+    FieldType::Price,
+    FieldType::Quantity,
+    FieldType::Enum,
+];
 
-let mut enc = Codec::new(&schema);
-let mut dec = Codec::new(&schema);
+let mut enc = Codec::new(fields, None).unwrap();
+let mut dec = Codec::new(fields, None).unwrap();
 
-let msg = Message::new()
-    .set(0, 34_200_000_000_000u64)
-    .set(1, 42u64)
-    .set(2, 1_500_250u64)
-    .set(3, 100u64)
-    .set(4, 0u64);
-
-let mut buf = [0u8; 64];
-let len = enc.encode(&msg, &mut buf).unwrap();
-let decoded = dec.decode(&buf[..len]).unwrap();
-assert_eq!(decoded.get(2), 1_500_250);
+let values = [34_200_000_000_000u64, 42, 1_500_250, 100, 0];
+let compressed = enc.encode(&values).unwrap();
+let decoded = dec.decode(&compressed).unwrap();
+assert_eq!(&values[..], &decoded[..]);
 ```
 
 ## Field Types
@@ -156,12 +145,11 @@ For each message:
 4. **Tiered encode** the unsigned residual (parameterized by k):
 
 ```
-Tier 0:  0                       value = 0               cost: 1 bit
-Tier 1:  10  + k bits            values [1, 2^k]         cost: 2+k bits
-Tier 2:  110 + 2k bits           next 2^(2k) values      cost: 3+2k bits
-Tier 3:  1110 + 3k bits          next 2^(3k) values      cost: 4+3k bits
-Tier 4:  11110 + 32 bits         any 32-bit value         cost: 37 bits
-Tier 5:  11111 + 64 bits         any 64-bit value         cost: 69 bits
+Tier 0:  0    + k bits           values < 2^k            cost: 1+k bits
+Tier 1:  10   + (k+6) bits      values < 2^(k+6)        cost: 2+k+6 bits
+Tier 2:  110  + (k+12) bits     values < 2^(k+12)       cost: 3+k+12 bits
+Tier 3:  1110 + (k+20) bits     values < 2^(k+20)       cost: 4+k+20 bits
+Tier 4:  1111 + 64 bits         any value                cost: 68 bits
 ```
 
 5. **Update state** identically on both encoder and decoder
@@ -193,11 +181,11 @@ residc_restore(&decoder, &checkpoint);   // restore
 ```
 
 ```rust
-// Rust
-let checkpoint = decoder.snapshot();     // periodically
+// Rust SDK
+let checkpoint = decoder.snapshot().unwrap();  // periodically
 
 // ... gap detected ...
-decoder.restore_from(&checkpoint);       // restore
+decoder.restore(&checkpoint);                  // restore
 // replay messages from checkpoint onwards
 ```
 
@@ -216,10 +204,11 @@ residc_mfu_seed(&decoder.mfu, ids, counts, 5);  // must match
 ```
 
 ```rust
-// Rust
-let seed = [(42, 500), (99, 300), (7, 200), (101, 150), (55, 100)];
-encoder.seed_mfu(&seed);
-decoder.seed_mfu(&seed);  // must match
+// Rust SDK
+let ids = [42u16, 99, 7, 101, 55];
+let counts = [500u16, 300, 200, 150, 100];
+encoder.seed_mfu(&ids, &counts);
+decoder.seed_mfu(&ids, &counts);  // must match
 ```
 
 ## SDK (C-based, cross-language)
@@ -256,11 +245,11 @@ cc -O2 -o quote_example examples/custom/quote_example.c core/residc.c -Icore
 ./quote_example
 ```
 
-### Rust
+### Rust SDK
 
 ```bash
 cd rust
-cargo test     # 16 tests
+cargo test     # 7 tests + doctest
 cargo bench    # criterion benchmarks
 ```
 

@@ -1,15 +1,19 @@
 [package]
 name = "residc"
-version = "0.1.0"
-edition = "2024"
-description = "Per-message prediction-residual compression for financial data"
+version = "0.2.0"
+edition = "2021"
+description = "Per-message prediction-residual compression for financial data. Wraps the C core via FFI."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/userFRM/residc"
 readme = "README.md"
 keywords = ["compression", "financial", "market-data", "codec", "low-latency"]
-categories = ["compression", "encoding", "no-std::no-alloc"]
+categories = ["compression", "encoding"]
+build = "build.rs"
 
 [dependencies]
+
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -22,4 +26,3 @@ harness = false
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"

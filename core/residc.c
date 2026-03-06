@@ -798,6 +798,14 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
             is = (instrument_id < RESIDC_MAX_INSTRUMENTS)
                  ? &state->instruments[instrument_id] : NULL;
             val = instrument_id;
+            /* Commit: MFU update + state */
+            residc_mfu_update(&state->mfu, instrument_id);
+            state->mfu_decay_counter++;
+            if (state->mfu_decay_counter >= 10000) {
+                mfu_decay(&state->mfu);
+                state->mfu_decay_counter = 0;
+            }
+            state->last_instrument_id = instrument_id;
             break;
         }
 
@@ -830,6 +838,8 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                 state->recent_abs_price_sum = 0;
                 state->regime_counter = 0;
             }
+            /* Commit: price state */
+            if (is) is->last_price = price;
             break;
         }
 
@@ -850,6 +860,8 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                     val = (uint32_t)((int64_t)predicted + residual);
                 }
             }
+            /* Commit: qty state */
+            if (is) is->last_qty = (uint32_t)val;
             break;
         }
 
@@ -865,6 +877,9 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
 
             uint64_t zz = residc_zigzag_enc(delta);
             residc_adaptive_update(&fs->adapt_sum, &fs->adapt_count, zz);
+            /* Commit: seq state */
+            fs->last_value = val;
+            if (is) is->last_seq_id = val;
             break;
         }
 
@@ -875,6 +890,8 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
             } else {
                 val = br_read(br, f->size * 8);
             }
+            /* Commit: enum state */
+            fs->last_value = val;
             break;
         }
 
@@ -891,6 +908,8 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                 uint64_t lo = br_read(br, 16);
                 val = (hi << 16) | lo;
             }
+            /* Commit: categorical state */
+            fs->last_value = val;
             break;
         }
 
@@ -913,6 +932,8 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
             int k = k_seqid(state->regime);
             int64_t delta = decode_residual(br, k);
             val = ref_val + (uint64_t)delta;
+            /* Commit: delta id state */
+            state->field_state[fi].last_value = val;
             break;
         }
 
@@ -933,6 +954,10 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
 
         write_field(msg, f->offset, f->size, val);
     }
+
+    /* Finalize message-level counters */
+    if (is) is->msg_count++;
+    state->msg_count++;
 
     return 0;
 }
@@ -972,7 +997,7 @@ int residc_decode(residc_state_t *state, const uint8_t *in, int in_len,
     residc_br_init(&br, in + 1, payload_len);
 
     decode_fields(state, schema, &br, msg);
-    commit_state(state, schema, msg);
+    /* State committed inline during decode_fields */
 
     return 1 + payload_len;
 }
@@ -1118,7 +1143,7 @@ int residc_decode_multi(residc_state_t *state, const uint8_t *in, int in_len,
     *(uint8_t *)((uint8_t *)msg + multi->type_offset) = type_val;
 
     decode_fields(state, schema, &br, msg);
-    commit_state(state, schema, msg);
+    /* State committed inline during decode_fields */
     state->last_msg_type_index = (uint8_t)type_idx;
 
     return 1 + payload_len;

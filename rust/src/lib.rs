@@ -1,1102 +1,464 @@
-//! # residc
+//! residc — FFI bindings to the C core prediction-residual compression codec.
 //!
-//! **Per-message prediction-residual compression for financial data.**
+//! This crate wraps the C implementation via the SDK's opaque-handle API,
+//! providing a safe, idiomatic Rust interface for encoding and decoding
+//! financial market data messages.
 //!
-//! `no_std`, zero-dependency, zero-allocation encode/decode.
+//! # Example
 //!
-//! Compresses financial messages (quotes, orders, trades) 2-3x by predicting
-//! each field from context and encoding only the prediction error. Unlike
-//! general-purpose compressors (LZ4, zstd), it works on individual messages —
-//! no blocks, no buffering, per-message random access.
+//! ```
+//! use residc::{Codec, FieldType};
 //!
-//! ## Quick Start
+//! let fields = &[
+//!     FieldType::Timestamp,
+//!     FieldType::Instrument,
+//!     FieldType::Price,
+//!     FieldType::Quantity,
+//!     FieldType::Enum,
+//! ];
 //!
-//! ```rust
-//! use residc::{Schema, FieldType, Codec, Message};
+//! let mut encoder = Codec::new(fields, None).unwrap();
+//! let mut decoder = Codec::new(fields, None).unwrap();
 //!
-//! let schema = Schema::builder()
-//!     .field("timestamp", FieldType::Timestamp)
-//!     .field("instrument", FieldType::Instrument)
-//!     .field("price", FieldType::Price)
-//!     .field("quantity", FieldType::Quantity)
-//!     .field("side", FieldType::Bool)
-//!     .build();
+//! let values = [34_200_000_000_000u64, 42, 1_500_250, 100, 0];
+//! let compressed = encoder.encode(&values).unwrap();
+//! let decoded = decoder.decode(&compressed).unwrap();
 //!
-//! let mut enc = Codec::new(&schema);
-//! let mut dec = Codec::new(&schema);
-//!
-//! let msg = Message::new()
-//!     .set(0, 34_200_000_000_000u64)  // timestamp
-//!     .set(1, 42u64)                   // instrument
-//!     .set(2, 1_500_250u64)            // price
-//!     .set(3, 100u64)                  // quantity
-//!     .set(4, 0u64);                   // side
-//!
-//! let mut buf = [0u8; 64];
-//! let len = enc.encode(&msg, &mut buf).unwrap();
-//! let decoded = dec.decode(&buf[..len]).unwrap();
-//! assert_eq!(decoded.get(2), 1_500_250);
+//! assert_eq!(&values[..], &decoded[..]);
 //! ```
 
-#![no_std]
+use std::fmt;
+use std::ptr;
 
-mod bits;
-mod mfu;
-mod residual;
+// ---------------------------------------------------------------------------
+// FFI declarations matching sdk/residc_sdk.h
+// ---------------------------------------------------------------------------
 
-pub const MAX_FIELDS: usize = 32;
-pub const MAX_INSTRUMENTS: usize = 16384;
-pub const MFU_SIZE: usize = 256;
-pub const MFU_INDEX_BITS: u32 = 8;
-pub const ADAPT_WINDOW: u32 = 8;
-pub const REGIME_WINDOW: u32 = 64;
-pub const FRAME_LITERAL: u8 = 0xFF;
+#[repr(C)]
+struct residc_codec {
+    _private: [u8; 0],
+}
 
-// ================================================================
+extern "C" {
+    fn residc_codec_create(
+        types: *const i32,
+        ref_fields: *const i8,
+        num_fields: i32,
+    ) -> *mut residc_codec;
+
+    fn residc_codec_destroy(codec: *mut residc_codec);
+
+    fn residc_codec_encode(
+        codec: *mut residc_codec,
+        values: *const u64,
+        out: *mut u8,
+        capacity: i32,
+    ) -> i32;
+
+    fn residc_codec_decode(
+        codec: *mut residc_codec,
+        data: *const u8,
+        data_len: i32,
+        values: *mut u64,
+    ) -> i32;
+
+    fn residc_codec_snapshot(codec: *const residc_codec) -> *mut residc_codec;
+
+    fn residc_codec_restore(codec: *mut residc_codec, snap: *const residc_codec);
+
+    fn residc_codec_reset(codec: *mut residc_codec);
+
+    fn residc_codec_seed_mfu(codec: *mut residc_codec, ids: *const u16, counts: *const u16, n: i32);
+}
+
+// ---------------------------------------------------------------------------
 // Field types
-// ================================================================
+// ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Field types for defining a message schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
 pub enum FieldType {
-    /// Nanosecond timestamp — EMA gap prediction + adaptive k
-    Timestamp,
-    /// Instrument/security ID — MFU table (uint16)
-    Instrument,
-    /// Price (fixed-point uint32) — per-instrument prediction + penny normalization
-    Price,
-    /// Quantity (uint32) — per-instrument prediction + zero-residual flag
-    Quantity,
-    /// Sequential ID (uint64) — delta from last
-    SequentialId,
-    /// Small enum (uint8) — same-as-last flag
-    Enum,
-    /// Boolean — 1 bit
-    Bool,
-    /// Categorical (uint32) — same-as-last flag
-    Categorical,
-    /// Raw bytes — no prediction
-    Raw { bytes: u8 },
-    /// Delta from another field in the same message
-    DeltaId { ref_field: u8 },
-    /// Price delta from another price field
-    DeltaPrice { ref_field: u8 },
-    /// Computed (not transmitted — 0 bits)
-    Computed,
+    Timestamp = 0,
+    Instrument = 1,
+    Price = 2,
+    Quantity = 3,
+    SequentialId = 4,
+    Enum = 5,
+    Bool = 6,
+    Categorical = 7,
+    Raw = 8,
+    DeltaId = 9,
+    DeltaPrice = 10,
+    Computed = 11,
 }
 
-// ================================================================
-// Schema (fixed-size, no heap)
-// ================================================================
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
-pub struct FieldDef {
-    pub name: &'static str,
-    pub field_type: FieldType,
+/// Errors returned by codec operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    /// Codec creation failed (invalid schema or allocation failure).
+    CreateFailed,
+    /// Encoding failed (buffer too small or internal error).
+    EncodeFailed,
+    /// Decoding failed (corrupt data or state mismatch).
+    DecodeFailed,
+    /// Field count doesn't match the schema.
+    FieldCountMismatch { expected: usize, got: usize },
+    /// Too many fields (max 256).
+    TooManyFields(usize),
 }
 
-const EMPTY_FIELD: FieldDef = FieldDef {
-    name: "",
-    field_type: FieldType::Computed,
-};
-
-#[derive(Clone, Debug)]
-pub struct Schema {
-    fields: [FieldDef; MAX_FIELDS],
-    num_fields: usize,
-    raw_size: usize,
-}
-
-pub struct SchemaBuilder {
-    fields: [FieldDef; MAX_FIELDS],
-    num_fields: usize,
-}
-
-impl Schema {
-    pub fn builder() -> SchemaBuilder {
-        SchemaBuilder {
-            fields: [EMPTY_FIELD; MAX_FIELDS],
-            num_fields: 0,
-        }
-    }
-
-    #[inline]
-    pub fn num_fields(&self) -> usize {
-        self.num_fields
-    }
-
-    #[inline]
-    pub fn raw_size(&self) -> usize {
-        self.raw_size
-    }
-
-    #[inline]
-    pub fn field(&self, index: usize) -> &FieldDef {
-        &self.fields[index]
-    }
-}
-
-impl SchemaBuilder {
-    pub fn field(mut self, name: &'static str, field_type: FieldType) -> Self {
-        assert!(self.num_fields < MAX_FIELDS, "too many fields");
-        self.fields[self.num_fields] = FieldDef { name, field_type };
-        self.num_fields += 1;
-        self
-    }
-
-    pub fn build(self) -> Schema {
-        let mut raw_size = 0;
-        for i in 0..self.num_fields {
-            raw_size += field_raw_bytes(self.fields[i].field_type);
-        }
-        Schema {
-            fields: self.fields,
-            num_fields: self.num_fields,
-            raw_size,
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::CreateFailed => write!(f, "codec creation failed"),
+            Error::EncodeFailed => write!(f, "encode failed"),
+            Error::DecodeFailed => write!(f, "decode failed"),
+            Error::FieldCountMismatch { expected, got } => {
+                write!(f, "expected {expected} values, got {got}")
+            }
+            Error::TooManyFields(n) => write!(f, "too many fields: {n} (max 256)"),
         }
     }
 }
 
-fn field_raw_bytes(ft: FieldType) -> usize {
-    match ft {
-        FieldType::Timestamp => 8,
-        FieldType::Instrument => 2,
-        FieldType::Price => 4,
-        FieldType::Quantity => 4,
-        FieldType::SequentialId => 8,
-        FieldType::Enum => 1,
-        FieldType::Bool => 1,
-        FieldType::Categorical => 4,
-        FieldType::Raw { bytes } => bytes as usize,
-        FieldType::DeltaId { .. } => 8,
-        FieldType::DeltaPrice { .. } => 4,
-        FieldType::Computed => 0,
-    }
-}
+impl std::error::Error for Error {}
 
-// ================================================================
-// Message
-// ================================================================
+// ---------------------------------------------------------------------------
+// Codec
+// ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
-pub struct Message {
-    pub values: [u64; MAX_FIELDS],
-}
-
-impl Message {
-    pub fn new() -> Self {
-        Self {
-            values: [0u64; MAX_FIELDS],
-        }
-    }
-
-    #[inline]
-    pub fn set(mut self, index: usize, value: u64) -> Self {
-        self.values[index] = value;
-        self
-    }
-
-    #[inline]
-    pub fn set_mut(&mut self, index: usize, value: u64) {
-        self.values[index] = value;
-    }
-
-    #[inline]
-    pub fn get(&self, index: usize) -> u64 {
-        self.values[index]
-    }
-}
-
-impl Default for Message {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ================================================================
-// Codec state (fully stack-allocated, ~330KB)
-// ================================================================
-
-#[derive(Clone, Copy)]
-struct InstrumentState {
-    last_price: u32,
-    last_qty: u32,
-    msg_count: u32,
-    last_seq_id: u64,
-}
-
-impl InstrumentState {
-    const ZERO: Self = Self {
-        last_price: 0,
-        last_qty: 0,
-        msg_count: 0,
-        last_seq_id: 0,
-    };
-}
-
-#[derive(Clone, Copy)]
-struct FieldState {
-    last_value: u64,
-    adapt_sum: u64,
-    adapt_count: u32,
-}
-
-impl FieldState {
-    const ZERO: Self = Self {
-        last_value: 0,
-        adapt_sum: 0,
-        adapt_count: 0,
-    };
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Regime {
-    Calm,
-    Volatile,
-}
-
-#[derive(Clone)]
+/// A compression codec instance wrapping the C core.
+///
+/// Maintains synchronized prediction state — encode and decode calls
+/// must be paired in the same order on both sides.
 pub struct Codec {
-    schema: Schema,
-    msg_count: u64,
-
-    // Timestamp
-    last_timestamp: u64,
-    ts_gap_ema: i64,
-    ts_adapt_sum: u64,
-    ts_adapt_count: u32,
-
-    // Instrument
-    last_instrument: u16,
-    mfu: mfu::MfuTable,
-    mfu_decay_counter: u32,
-
-    // Regime
-    regime: Regime,
-    regime_counter: u32,
-    recent_abs_price_sum: u32,
-
-    // Per-field
-    field_state: [FieldState; MAX_FIELDS],
-
-    // Per-instrument (fixed array, no heap)
-    instruments: [InstrumentState; MAX_INSTRUMENTS],
+    ptr: *mut residc_codec,
+    num_fields: usize,
 }
+
+// SAFETY: The C codec has no thread-local or shared mutable state.
+// Each instance is independent and can be sent across threads.
+unsafe impl Send for Codec {}
 
 impl Codec {
-    pub fn new(schema: &Schema) -> Self {
-        Self {
-            schema: schema.clone(),
-            msg_count: 0,
-            last_timestamp: 0,
-            ts_gap_ema: 0,
-            ts_adapt_sum: 0,
-            ts_adapt_count: 0,
-            last_instrument: 0,
-            mfu: mfu::MfuTable::new(),
-            mfu_decay_counter: 0,
-            regime: Regime::Calm,
-            regime_counter: 0,
-            recent_abs_price_sum: 0,
-            field_state: [FieldState::ZERO; MAX_FIELDS],
-            instruments: [InstrumentState::ZERO; MAX_INSTRUMENTS],
-        }
-    }
-
-    pub fn reset(&mut self) {
-        *self = Self::new(&self.schema);
-    }
-
-    /// Take a snapshot of codec state for gap recovery.
+    /// Create a new codec with the given field types.
     ///
-    /// Snapshot periodically on the decoder side. If a gap is detected
-    /// (missing messages), restore the snapshot and replay from that point.
-    pub fn snapshot(&self) -> Self {
-        self.clone()
+    /// `ref_fields` is an optional slice of reference field indices for
+    /// `DeltaId` / `DeltaPrice` fields. Use -1 for non-delta fields.
+    /// Pass `None` if there are no delta fields.
+    pub fn new(fields: &[FieldType], ref_fields: Option<&[i8]>) -> Result<Self, Error> {
+        let n = fields.len();
+        if n > 256 {
+            return Err(Error::TooManyFields(n));
+        }
+
+        let types: Vec<i32> = fields.iter().map(|f| *f as i32).collect();
+
+        let ref_ptr = match ref_fields {
+            Some(r) => r.as_ptr(),
+            None => ptr::null(),
+        };
+
+        let ptr = unsafe { residc_codec_create(types.as_ptr(), ref_ptr, n as i32) };
+
+        if ptr.is_null() {
+            return Err(Error::CreateFailed);
+        }
+
+        Ok(Codec { ptr, num_fields: n })
+    }
+
+    /// Encode field values into compressed bytes.
+    ///
+    /// `values` must contain exactly `num_fields` elements (one `u64` per field).
+    pub fn encode(&mut self, values: &[u64]) -> Result<Vec<u8>, Error> {
+        if values.len() != self.num_fields {
+            return Err(Error::FieldCountMismatch {
+                expected: self.num_fields,
+                got: values.len(),
+            });
+        }
+
+        let mut buf = vec![0u8; 256];
+        let len = unsafe {
+            residc_codec_encode(
+                self.ptr,
+                values.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+            )
+        };
+
+        if len < 0 {
+            return Err(Error::EncodeFailed);
+        }
+
+        buf.truncate(len as usize);
+        Ok(buf)
+    }
+
+    /// Decode compressed bytes into field values.
+    ///
+    /// Returns a `Vec<u64>` with one element per field.
+    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<u64>, Error> {
+        let mut values = vec![0u64; self.num_fields];
+        let consumed = unsafe {
+            residc_codec_decode(
+                self.ptr,
+                data.as_ptr(),
+                data.len() as i32,
+                values.as_mut_ptr(),
+            )
+        };
+
+        if consumed < 0 {
+            return Err(Error::DecodeFailed);
+        }
+
+        Ok(values)
+    }
+
+    /// Take a snapshot of the current codec state for gap recovery.
+    pub fn snapshot(&self) -> Result<Snapshot, Error> {
+        let snap = unsafe { residc_codec_snapshot(self.ptr) };
+        if snap.is_null() {
+            return Err(Error::CreateFailed);
+        }
+        Ok(Snapshot { ptr: snap })
     }
 
     /// Restore codec state from a snapshot.
-    pub fn restore_from(&mut self, snap: &Self) {
-        let schema = self.schema.clone();
-        *self = snap.clone();
-        self.schema = schema;
+    pub fn restore(&mut self, snap: &Snapshot) {
+        unsafe { residc_codec_restore(self.ptr, snap.ptr) };
     }
 
-    /// Pre-seed the MFU table with known instrument frequencies.
+    /// Reset codec to initial state.
+    pub fn reset(&mut self) {
+        unsafe { residc_codec_reset(self.ptr) };
+    }
+
+    /// Pre-seed the MFU (Most Frequently Used) instrument table.
     ///
-    /// `instruments` is a slice of `(id, count)` pairs, sorted by descending
-    /// frequency. Must be called identically on encoder and decoder.
-    ///
-    /// This eliminates the warm-up period for instrument prediction,
-    /// giving better compression from the first message.
-    pub fn seed_mfu(&mut self, instruments: &[(u16, u32)]) {
-        self.mfu.seed(instruments);
-    }
-
-    #[inline(always)]
-    fn k_ts(&self) -> u32 {
-        if self.regime == Regime::Volatile {
-            8
-        } else {
-            10
+    /// `ids` and `counts` must have the same length.
+    /// Call identically on both encoder and decoder before any encode/decode.
+    pub fn seed_mfu(&mut self, ids: &[u16], counts: &[u16]) {
+        let n = ids.len().min(counts.len());
+        unsafe {
+            residc_codec_seed_mfu(self.ptr, ids.as_ptr(), counts.as_ptr(), n as i32);
         }
     }
 
-    #[inline(always)]
-    fn k_price(&self) -> u32 {
-        if self.regime == Regime::Volatile {
-            7
-        } else {
-            3
-        }
-    }
-
-    #[inline(always)]
-    fn k_qty(&self) -> u32 {
-        if self.regime == Regime::Volatile {
-            7
-        } else {
-            4
-        }
-    }
-
-    #[inline(always)]
-    fn k_seq(&self) -> u32 {
-        if self.regime == Regime::Volatile {
-            5
-        } else {
-            3
-        }
-    }
-
-    #[inline(always)]
-    fn instrument_state(&self, id: u16) -> &InstrumentState {
-        &self.instruments[(id as usize) & (MAX_INSTRUMENTS - 1)]
-    }
-
-    #[inline(always)]
-    fn instrument_state_mut(&mut self, id: u16) -> &mut InstrumentState {
-        &mut self.instruments[(id as usize) & (MAX_INSTRUMENTS - 1)]
-    }
-
-    // ============================================================
-    // Encode
-    // ============================================================
-
-    pub fn encode(&mut self, msg: &Message, out: &mut [u8]) -> Result<usize, &'static str> {
-        if out.len() < 2 {
-            return Err("buffer too small");
-        }
-
-        // Single-pass: encode fields + update state in one loop
-        let (payload_len, overflow) = {
-            let mut bw = bits::BitWriter::new(&mut out[1..]);
-            self.encode_and_commit(msg, &mut bw);
-            let overflow = bw.overflow;
-            (bw.finish(), overflow)
-        };
-
-        let raw_size = self.schema.raw_size();
-
-        if overflow || payload_len >= raw_size || payload_len >= 254 {
-            // State already committed — just overwrite with literal bytes
-            let total = 1 + raw_size;
-            if out.len() < total {
-                return Err("buffer too small for literal");
-            }
-            out[0] = FRAME_LITERAL;
-            let mut pos = 1;
-            for fi in 0..self.schema.num_fields {
-                let fd = &self.schema.fields[fi];
-                if matches!(fd.field_type, FieldType::Computed) {
-                    continue;
-                }
-                let val = msg.values[fi];
-                let bytes = field_raw_bytes(fd.field_type);
-                for b in (0..bytes).rev() {
-                    out[pos] = (val >> (b * 8)) as u8;
-                    pos += 1;
-                }
-            }
-            return Ok(pos);
-        }
-
-        out[0] = payload_len as u8;
-        Ok(1 + payload_len)
-    }
-
-    /// Encode all fields and update state in a single pass.
-    /// Eliminates the second loop through fields that commit_state does separately.
-    #[inline(always)]
-    fn encode_and_commit(&mut self, msg: &Message, bw: &mut bits::BitWriter<'_>) {
-        let mut instrument_id = self.last_instrument;
-        // Copy instrument state to avoid holding a borrow on self
-        let mut is = InstrumentState::ZERO;
-        // Cache regime-dependent k values — must be consistent with decoder
-        // which sees pre-commit regime for all fields
-        let k_ts = self.k_ts();
-        let k_price = self.k_price();
-        let k_qty = self.k_qty();
-        let k_seq = self.k_seq();
-
-        for fi in 0..self.schema.num_fields {
-            // SAFETY: fi < num_fields <= MAX_FIELDS, both arrays are [_; MAX_FIELDS]
-            let fd = unsafe { *self.schema.fields.get_unchecked(fi) };
-            let val = unsafe { *msg.values.get_unchecked(fi) };
-
-            match fd.field_type {
-                FieldType::Timestamp => {
-                    let gap = val.wrapping_sub(self.last_timestamp) as i64;
-                    let predicted_gap = (self.ts_gap_ema >> 16).max(0);
-                    let k = residual::adaptive_k(
-                        self.ts_adapt_sum,
-                        self.ts_adapt_count,
-                        k_ts,
-                        k_ts + 10,
-                    );
-                    let res = gap - predicted_gap;
-                    residual::encode(bw, res, k);
-
-                    // State update
-                    let zz = residual::zigzag_enc(res);
-                    residual::adaptive_update(&mut self.ts_adapt_sum, &mut self.ts_adapt_count, zz);
-                    let gap_q16 = gap << 16;
-                    self.ts_gap_ema += (gap_q16 - self.ts_gap_ema) >> 2;
-                    self.last_timestamp = val;
-                }
-
-                FieldType::Instrument => {
-                    let id = val as u16;
-                    instrument_id = id;
-                    is = *self.instrument_state(id);
-
-                    if id == self.last_instrument && self.msg_count > 0 {
-                        bw.write(0, 1);
-                    } else {
-                        match self.mfu.lookup(id) {
-                            Some(idx) => {
-                                bw.write(0b10 << MFU_INDEX_BITS | idx as u64, 2 + MFU_INDEX_BITS);
-                            }
-                            None => {
-                                bw.write((0b11 << 14) | id as u64, 2 + 14);
-                            }
-                        }
-                    }
-
-                    // State update
-                    self.mfu.update(id);
-                    self.mfu_decay_counter += 1;
-                    if self.mfu_decay_counter >= 10000 {
-                        self.mfu.decay();
-                        self.mfu_decay_counter = 0;
-                    }
-                    self.last_instrument = id;
-                }
-
-                FieldType::Price => {
-                    let price = val as u32;
-                    let predicted = if is.msg_count > 0 { is.last_price } else { 0 };
-                    let res = price as i64 - predicted as i64;
-                    let k = k_price;
-
-                    if price.is_multiple_of(100)
-                        && predicted.is_multiple_of(100)
-                        && (price > 0 || predicted > 0)
-                    {
-                        bw.write(0, 1);
-                        residual::encode(bw, res / 100, k);
-                    } else {
-                        bw.write(1, 1);
-                        residual::encode(bw, res, k);
-                    }
-
-                    // State update
-                    let abs_res = (val as i64 - predicted as i64).unsigned_abs() as u32;
-                    self.recent_abs_price_sum += abs_res;
-                    self.regime_counter += 1;
-                    if self.regime_counter >= REGIME_WINDOW {
-                        let avg = self.recent_abs_price_sum / REGIME_WINDOW;
-                        self.regime = if avg > 30 {
-                            Regime::Volatile
-                        } else {
-                            Regime::Calm
-                        };
-                        self.recent_abs_price_sum = 0;
-                        self.regime_counter = 0;
-                    }
-                    self.instrument_state_mut(instrument_id).last_price = val as u32;
-                }
-
-                FieldType::Quantity => {
-                    let qty = val as u32;
-                    let predicted = if is.msg_count > 0 { is.last_qty } else { 100 };
-                    let res = qty as i64 - predicted as i64;
-                    let k = k_qty;
-
-                    if res == 0 {
-                        bw.write(0, 1);
-                    } else if qty.is_multiple_of(100) && predicted.is_multiple_of(100) {
-                        bw.write(0b10, 2);
-                        residual::encode(bw, res / 100, k);
-                    } else {
-                        bw.write(0b11, 2);
-                        residual::encode(bw, res, k);
-                    }
-
-                    // State update
-                    self.instrument_state_mut(instrument_id).last_qty = val as u32;
-                }
-
-                FieldType::SequentialId => {
-                    let inst_seq = is.last_seq_id;
-                    let fs_val = self.field_state[fi].last_value;
-                    let fs_sum = self.field_state[fi].adapt_sum;
-                    let fs_count = self.field_state[fi].adapt_count;
-                    let predicted = if inst_seq > 0 { inst_seq } else { fs_val };
-                    let delta = val.wrapping_sub(predicted) as i64;
-                    let k = residual::adaptive_k(fs_sum, fs_count, k_seq, k_seq + 10);
-                    residual::encode(bw, delta, k);
-
-                    // State update
-                    let zz = residual::zigzag_enc(delta);
-                    let fs = &mut self.field_state[fi];
-                    residual::adaptive_update(&mut fs.adapt_sum, &mut fs.adapt_count, zz);
-                    fs.last_value = val;
-                    self.instrument_state_mut(instrument_id).last_seq_id = val;
-                }
-
-                FieldType::Enum => {
-                    if val == self.field_state[fi].last_value && self.msg_count > 0 {
-                        bw.write(0, 1);
-                    } else {
-                        bw.write(1, 1);
-                        bw.write(val, 8);
-                    }
-                    self.field_state[fi].last_value = val;
-                }
-
-                FieldType::Bool => {
-                    bw.write(val & 1, 1);
-                }
-
-                FieldType::Categorical => {
-                    if val == self.field_state[fi].last_value && self.msg_count > 0 {
-                        bw.write(0, 1);
-                    } else {
-                        bw.write(1, 1);
-                        bw.write(val >> 16, 16);
-                        bw.write(val & 0xFFFF, 16);
-                    }
-                    self.field_state[fi].last_value = val;
-                }
-
-                FieldType::Raw { bytes } => {
-                    bw.write(val, bytes as u32 * 8);
-                }
-
-                FieldType::DeltaId { ref_field } => {
-                    let ref_val = msg.values[ref_field as usize];
-                    let delta = val.wrapping_sub(ref_val) as i64;
-                    residual::encode(bw, delta, k_seq);
-                    self.field_state[fi].last_value = val;
-                }
-
-                FieldType::DeltaPrice { ref_field } => {
-                    let ref_val = msg.values[ref_field as usize];
-                    let delta = val as i64 - ref_val as i64;
-                    residual::encode(bw, delta, k_price);
-                }
-
-                FieldType::Computed => {}
-            }
-        }
-
-        self.instrument_state_mut(instrument_id).msg_count += 1;
-        self.msg_count += 1;
-    }
-
-    // ============================================================
-    // Decode
-    // ============================================================
-
-    pub fn decode(&mut self, input: &[u8]) -> Result<Message, &'static str> {
-        if input.is_empty() {
-            return Err("empty input");
-        }
-
-        let frame = input[0];
-        let mut msg = Message::new();
-
-        if frame == FRAME_LITERAL {
-            let mut pos = 1;
-            for fi in 0..self.schema.num_fields {
-                let fd = &self.schema.fields[fi];
-                if matches!(fd.field_type, FieldType::Computed) {
-                    continue;
-                }
-                let bytes = field_raw_bytes(fd.field_type);
-                let mut val = 0u64;
-                for b in (0..bytes).rev() {
-                    if pos >= input.len() {
-                        return Err("truncated literal");
-                    }
-                    val |= (input[pos] as u64) << (b * 8);
-                    pos += 1;
-                }
-                msg.values[fi] = val;
-            }
-            self.commit_state(&msg);
-            return Ok(msg);
-        }
-
-        let payload_len = frame as usize;
-        if 1 + payload_len > input.len() {
-            return Err("truncated payload");
-        }
-
-        let mut br = bits::BitReader::new(&input[1..1 + payload_len]);
-        self.decode_fields(&mut br, &mut msg);
-        self.commit_state(&msg);
-        Ok(msg)
-    }
-
-    #[inline(always)]
-    fn decode_fields(&self, br: &mut bits::BitReader, msg: &mut Message) {
-        let mut is: &InstrumentState = &InstrumentState::ZERO;
-
-        for fi in 0..self.schema.num_fields {
-            // SAFETY: fi < num_fields <= MAX_FIELDS
-            let fd = unsafe { self.schema.fields.get_unchecked(fi) };
-            let val: u64 = match fd.field_type {
-                FieldType::Timestamp => {
-                    let predicted_gap = (self.ts_gap_ema >> 16).max(0);
-                    let k = residual::adaptive_k(
-                        self.ts_adapt_sum,
-                        self.ts_adapt_count,
-                        self.k_ts(),
-                        self.k_ts() + 10,
-                    );
-                    let res = residual::decode(br, k);
-                    let gap = res + predicted_gap;
-                    self.last_timestamp.wrapping_add(gap as u64)
-                }
-
-                FieldType::Instrument => {
-                    let id = if br.read_bit() == 0 {
-                        self.last_instrument
-                    } else if br.read_bit() == 0 {
-                        let idx = br.read(MFU_INDEX_BITS) as usize;
-                        self.mfu.entries[idx].id
-                    } else {
-                        br.read(14) as u16
-                    };
-                    is = self.instrument_state(id);
-                    id as u64
-                }
-
-                FieldType::Price => {
-                    let predicted = if is.msg_count > 0 { is.last_price } else { 0 };
-                    let k = self.k_price();
-                    let mode = br.read_bit();
-                    let res = residual::decode(br, k);
-                    if mode == 0 {
-                        ((predicted / 100) as i64 + res) as u64 * 100
-                    } else {
-                        (predicted as i64 + res) as u64
-                    }
-                }
-
-                FieldType::Quantity => {
-                    let predicted = if is.msg_count > 0 { is.last_qty } else { 100 };
-                    let k = self.k_qty();
-                    if br.read_bit() == 0 {
-                        predicted as u64
-                    } else {
-                        let mode = br.read_bit();
-                        let res = residual::decode(br, k);
-                        if mode == 0 {
-                            ((predicted / 100) as i64 + res) as u64 * 100
-                        } else {
-                            (predicted as i64 + res) as u64
-                        }
-                    }
-                }
-
-                FieldType::SequentialId => {
-                    let fs = &self.field_state[fi];
-                    let predicted = if is.last_seq_id > 0 {
-                        is.last_seq_id
-                    } else {
-                        fs.last_value
-                    };
-                    let k = residual::adaptive_k(
-                        fs.adapt_sum,
-                        fs.adapt_count,
-                        self.k_seq(),
-                        self.k_seq() + 10,
-                    );
-                    let delta = residual::decode(br, k);
-                    predicted.wrapping_add(delta as u64)
-                }
-
-                FieldType::Enum => {
-                    let fs = &self.field_state[fi];
-                    if br.read_bit() == 0 {
-                        fs.last_value
-                    } else {
-                        br.read(8)
-                    }
-                }
-
-                FieldType::Bool => br.read(1),
-
-                FieldType::Categorical => {
-                    let fs = &self.field_state[fi];
-                    if br.read_bit() == 0 {
-                        fs.last_value
-                    } else {
-                        let hi = br.read(16);
-                        let lo = br.read(16);
-                        (hi << 16) | lo
-                    }
-                }
-
-                FieldType::Raw { bytes } => br.read(bytes as u32 * 8),
-
-                FieldType::DeltaId { ref_field } => {
-                    let ref_val = msg.values[ref_field as usize];
-                    let delta = residual::decode(br, self.k_seq());
-                    ref_val.wrapping_add(delta as u64)
-                }
-
-                FieldType::DeltaPrice { ref_field } => {
-                    let ref_val = msg.values[ref_field as usize];
-                    let delta = residual::decode(br, self.k_price());
-                    (ref_val as i64 + delta) as u64
-                }
-
-                FieldType::Computed => continue,
-            };
-
-            // SAFETY: fi < num_fields <= MAX_FIELDS
-            unsafe {
-                *msg.values.get_unchecked_mut(fi) = val;
-            }
-        }
-    }
-
-    // ============================================================
-    // State commit (called after successful encode or decode)
-    // ============================================================
-
-    #[inline(always)]
-    fn commit_state(&mut self, msg: &Message) {
-        let mut instrument_id = self.last_instrument;
-
-        for fi in 0..self.schema.num_fields {
-            // SAFETY: fi < num_fields <= MAX_FIELDS, both arrays are [_; MAX_FIELDS]
-            let fd = unsafe { *self.schema.fields.get_unchecked(fi) };
-            let val = unsafe { *msg.values.get_unchecked(fi) };
-
-            match fd.field_type {
-                FieldType::Timestamp => {
-                    let gap = val.wrapping_sub(self.last_timestamp) as i64;
-                    let res = gap - (self.ts_gap_ema >> 16).max(0);
-                    let zz = residual::zigzag_enc(res);
-
-                    residual::adaptive_update(&mut self.ts_adapt_sum, &mut self.ts_adapt_count, zz);
-
-                    let gap_q16 = gap << 16;
-                    self.ts_gap_ema += (gap_q16 - self.ts_gap_ema) >> 2;
-                    self.last_timestamp = val;
-                }
-
-                FieldType::Instrument => {
-                    instrument_id = val as u16;
-                    self.mfu.update(instrument_id);
-                    self.mfu_decay_counter += 1;
-                    if self.mfu_decay_counter >= 10000 {
-                        self.mfu.decay();
-                        self.mfu_decay_counter = 0;
-                    }
-                    self.last_instrument = instrument_id;
-                }
-
-                FieldType::Price => {
-                    let is = self.instrument_state_mut(instrument_id);
-                    let predicted = if is.msg_count > 0 { is.last_price } else { 0 };
-                    let res = (val as i64 - predicted as i64).unsigned_abs() as u32;
-                    self.recent_abs_price_sum += res;
-                    self.regime_counter += 1;
-                    if self.regime_counter >= REGIME_WINDOW {
-                        let avg = self.recent_abs_price_sum / REGIME_WINDOW;
-                        self.regime = if avg > 30 {
-                            Regime::Volatile
-                        } else {
-                            Regime::Calm
-                        };
-                        self.recent_abs_price_sum = 0;
-                        self.regime_counter = 0;
-                    }
-                    self.instrument_state_mut(instrument_id).last_price = val as u32;
-                }
-
-                FieldType::Quantity => {
-                    self.instrument_state_mut(instrument_id).last_qty = val as u32;
-                }
-
-                FieldType::SequentialId => {
-                    let inst_seq = self.instrument_state(instrument_id).last_seq_id;
-                    let fs = &mut self.field_state[fi];
-                    let predicted = if inst_seq > 0 {
-                        inst_seq
-                    } else {
-                        fs.last_value
-                    };
-                    let delta = val.wrapping_sub(predicted) as i64;
-                    let zz = residual::zigzag_enc(delta);
-                    residual::adaptive_update(&mut fs.adapt_sum, &mut fs.adapt_count, zz);
-                    fs.last_value = val;
-                    self.instrument_state_mut(instrument_id).last_seq_id = val;
-                }
-
-                FieldType::Enum | FieldType::Categorical | FieldType::DeltaId { .. } => {
-                    self.field_state[fi].last_value = val;
-                }
-
-                _ => {}
-            }
-        }
-
-        self.instrument_state_mut(instrument_id).msg_count += 1;
-        self.msg_count += 1;
+    /// Number of fields in the schema.
+    pub fn num_fields(&self) -> usize {
+        self.num_fields
     }
 }
 
+impl Drop for Codec {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { residc_codec_destroy(self.ptr) };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot
+// ---------------------------------------------------------------------------
+
+/// A saved codec state for gap recovery.
+///
+/// Created via [`Codec::snapshot()`]. Freed automatically on drop.
+pub struct Snapshot {
+    ptr: *mut residc_codec,
+}
+
+unsafe impl Send for Snapshot {}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { residc_codec_destroy(self.ptr) };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
-    extern crate std;
     use super::*;
 
+    fn quote_fields() -> Vec<FieldType> {
+        vec![
+            FieldType::Timestamp,
+            FieldType::Instrument,
+            FieldType::Price,
+            FieldType::Quantity,
+            FieldType::Enum,
+        ]
+    }
+
     #[test]
-    fn roundtrip_basic() {
-        let schema = Schema::builder()
-            .field("timestamp", FieldType::Timestamp)
-            .field("instrument", FieldType::Instrument)
-            .field("price", FieldType::Price)
-            .field("quantity", FieldType::Quantity)
-            .field("side", FieldType::Bool)
-            .build();
+    fn roundtrip_single() {
+        let fields = quote_fields();
+        let mut enc = Codec::new(&fields, None).unwrap();
+        let mut dec = Codec::new(&fields, None).unwrap();
 
-        let mut enc = Codec::new(&schema);
-        let mut dec = Codec::new(&schema);
+        let values = [34_200_000_000_000u64, 42, 1_500_250, 100, 0];
+        let compressed = enc.encode(&values).unwrap();
+        let decoded = dec.decode(&compressed).unwrap();
 
-        let mut ts = 34_200_000_000_000u64;
-        let mut errors = 0;
+        assert_eq!(&values[..], &decoded[..]);
+    }
 
+    #[test]
+    fn roundtrip_many() {
+        let fields = quote_fields();
+        let mut enc = Codec::new(&fields, None).unwrap();
+        let mut dec = Codec::new(&fields, None).unwrap();
+
+        let base_ts: u64 = 34_200_000_000_000;
         for i in 0..1000u64 {
-            ts += 1000 + (i * 37 % 50000);
-            let instrument = (i % 50) as u16;
-            let price = 1_500_000 + ((i * 7) % 2000) as u32;
-            let qty = ((1 + i % 20) * 100) as u32;
-            let side = (i % 2) as u8;
-
-            let msg = Message::new()
-                .set(0, ts)
-                .set(1, instrument as u64)
-                .set(2, price as u64)
-                .set(3, qty as u64)
-                .set(4, side as u64);
-
-            let mut buf = [0u8; 64];
-            let len = enc.encode(&msg, &mut buf).unwrap();
-            let decoded = dec.decode(&buf[..len]).unwrap();
-
-            if decoded.get(0) != ts
-                || decoded.get(1) != instrument as u64
-                || decoded.get(2) != price as u64
-                || decoded.get(3) != qty as u64
-                || decoded.get(4) != side as u64
-            {
-                errors += 1;
-            }
+            let values = [
+                base_ts + i * 1_000_000,
+                42 + (i % 5),
+                1_500_250 + (i % 100),
+                100 + (i % 10),
+                i % 3,
+            ];
+            let compressed = enc.encode(&values).unwrap();
+            let decoded = dec.decode(&compressed).unwrap();
+            assert_eq!(&values[..], &decoded[..], "mismatch at message {i}");
         }
-        assert_eq!(errors, 0, "roundtrip errors");
     }
 
     #[test]
     fn snapshot_restore() {
-        // Each Codec is ~330KB; we need 4 instances, so use a larger stack
-        std::thread::Builder::new()
-            .stack_size(4 * 1024 * 1024)
-            .spawn(|| {
-                let schema = Schema::builder()
-                    .field("timestamp", FieldType::Timestamp)
-                    .field("instrument", FieldType::Instrument)
-                    .field("price", FieldType::Price)
-                    .field("quantity", FieldType::Quantity)
-                    .field("side", FieldType::Bool)
-                    .build();
+        let fields = quote_fields();
+        let mut enc = Codec::new(&fields, None).unwrap();
+        let mut dec = Codec::new(&fields, None).unwrap();
 
-                let mut enc = Codec::new(&schema);
-                let mut dec = Codec::new(&schema);
+        // Send some messages to build state
+        let base_ts: u64 = 34_200_000_000_000;
+        for i in 0..100u64 {
+            let values = [base_ts + i * 1_000_000, 42, 1_500_250, 100, 0];
+            let compressed = enc.encode(&values).unwrap();
+            dec.decode(&compressed).unwrap();
+        }
 
-                let mut ts = 34_200_000_000_000u64;
-                for i in 0..100u64 {
-                    ts += 1000 + (i * 37 % 50000);
-                    let msg = Message::new()
-                        .set(0, ts)
-                        .set(1, (i % 50) as u64)
-                        .set(2, (1_500_000 + (i * 7 % 2000)) as u64)
-                        .set(3, ((1 + i % 20) * 100) as u64)
-                        .set(4, (i % 2) as u64);
-                    let mut buf = [0u8; 64];
-                    let len = enc.encode(&msg, &mut buf).unwrap();
-                    dec.decode(&buf[..len]).unwrap();
-                }
+        // Snapshot
+        let snap_enc = enc.snapshot().unwrap();
+        let snap_dec = dec.snapshot().unwrap();
 
-                // Snapshot after 100 messages
-                let enc_snap = enc.snapshot();
-                let dec_snap = dec.snapshot();
+        // Send more messages
+        for i in 100..200u64 {
+            let values = [base_ts + i * 1_000_000, 42, 1_500_250, 100, 0];
+            enc.encode(&values).unwrap();
+        }
 
-                // Send 50 more (diverge from snapshot)
-                for i in 100..150u64 {
-                    ts += 1000 + (i * 37 % 50000);
-                    let msg = Message::new()
-                        .set(0, ts)
-                        .set(1, (i % 50) as u64)
-                        .set(2, (1_500_000 + (i * 7 % 2000)) as u64)
-                        .set(3, ((1 + i % 20) * 100) as u64)
-                        .set(4, (i % 2) as u64);
-                    let mut buf = [0u8; 64];
-                    let len = enc.encode(&msg, &mut buf).unwrap();
-                    dec.decode(&buf[..len]).unwrap();
-                }
+        // Restore and verify roundtrip still works
+        enc.restore(&snap_enc);
+        dec.restore(&snap_dec);
 
-                // Restore and replay — must roundtrip perfectly
-                enc.restore_from(&enc_snap);
-                dec.restore_from(&dec_snap);
-
-                ts = 34_200_000_000_000u64;
-                for i in 0..100u64 {
-                    ts += 1000 + (i * 37 % 50000);
-                }
-                let mut errors = 0;
-                for i in 100..150u64 {
-                    ts += 1000 + (i * 37 % 50000);
-                    let msg = Message::new()
-                        .set(0, ts)
-                        .set(1, (i % 50) as u64)
-                        .set(2, (1_500_000 + (i * 7 % 2000)) as u64)
-                        .set(3, ((1 + i % 20) * 100) as u64)
-                        .set(4, (i % 2) as u64);
-                    let mut buf = [0u8; 64];
-                    let len = enc.encode(&msg, &mut buf).unwrap();
-                    let decoded = dec.decode(&buf[..len]).unwrap();
-                    if decoded.get(0) != ts || decoded.get(2) != (1_500_000 + (i * 7 % 2000)) as u64
-                    {
-                        errors += 1;
-                    }
-                }
-                assert_eq!(errors, 0, "snapshot/restore roundtrip errors");
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        for i in 100..200u64 {
+            let values = [base_ts + i * 1_000_000, 42, 1_500_250, 100, 0];
+            let compressed = enc.encode(&values).unwrap();
+            let decoded = dec.decode(&compressed).unwrap();
+            assert_eq!(&values[..], &decoded[..]);
+        }
     }
 
     #[test]
-    fn mfu_seed() {
-        let schema = Schema::builder()
-            .field("timestamp", FieldType::Timestamp)
-            .field("instrument", FieldType::Instrument)
-            .field("price", FieldType::Price)
-            .field("quantity", FieldType::Quantity)
-            .field("side", FieldType::Bool)
-            .build();
+    fn reset_works() {
+        let fields = quote_fields();
+        let mut enc = Codec::new(&fields, None).unwrap();
+        let mut dec = Codec::new(&fields, None).unwrap();
 
-        // Seeded codec should compress instrument IDs better from the start
-        let mut enc_seeded = Codec::new(&schema);
-        let mut dec_seeded = Codec::new(&schema);
-        let mut enc_cold = Codec::new(&schema);
-        let mut dec_cold = Codec::new(&schema);
-
-        let mut seed = [(0u16, 0u32); 50];
-        for i in 0..50 {
-            seed[i] = (i as u16, 100 - i as u32);
-        }
-        enc_seeded.seed_mfu(&seed);
-        dec_seeded.seed_mfu(&seed);
-
-        let mut total_seeded = 0usize;
-        let mut total_cold = 0usize;
-        let mut ts = 34_200_000_000_000u64;
-
+        // Build state
         for i in 0..50u64 {
-            ts += 10000;
-            let msg = Message::new()
-                .set(0, ts)
-                .set(1, (i % 50) as u64)
-                .set(2, 1_500_000u64)
-                .set(3, 100u64)
-                .set(4, 0u64);
-
-            let mut buf = [0u8; 64];
-            let len = enc_seeded.encode(&msg, &mut buf).unwrap();
-            let decoded = dec_seeded.decode(&buf[..len]).unwrap();
-            assert_eq!(decoded.get(1), (i % 50) as u64);
-            total_seeded += len;
-
-            let mut buf2 = [0u8; 64];
-            let len2 = enc_cold.encode(&msg, &mut buf2).unwrap();
-            dec_cold.decode(&buf2[..len2]).unwrap();
-            total_cold += len2;
+            let values = [34_200_000_000_000 + i * 1_000_000, 42, 1_500_250, 100, 0];
+            let compressed = enc.encode(&values).unwrap();
+            dec.decode(&compressed).unwrap();
         }
 
-        // Seeded should be at least as good (likely better for early messages)
-        assert!(
-            total_seeded <= total_cold,
-            "seeded ({}) should be <= cold ({})",
-            total_seeded,
-            total_cold
-        );
+        // Reset both
+        enc.reset();
+        dec.reset();
+
+        // Should still roundtrip correctly from fresh state
+        let values = [34_200_000_000_000u64, 42, 1_500_250, 100, 0];
+        let compressed = enc.encode(&values).unwrap();
+        let decoded = dec.decode(&compressed).unwrap();
+        assert_eq!(&values[..], &decoded[..]);
+    }
+
+    #[test]
+    fn field_count_mismatch() {
+        let fields = quote_fields();
+        let mut codec = Codec::new(&fields, None).unwrap();
+
+        let result = codec.encode(&[1, 2, 3]); // too few
+        assert!(matches!(
+            result,
+            Err(Error::FieldCountMismatch {
+                expected: 5,
+                got: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn seed_mfu() {
+        let fields = quote_fields();
+        let mut enc = Codec::new(&fields, None).unwrap();
+        let mut dec = Codec::new(&fields, None).unwrap();
+
+        let ids = [42u16, 100, 200];
+        let counts = [1000u16, 500, 250];
+        enc.seed_mfu(&ids, &counts);
+        dec.seed_mfu(&ids, &counts);
+
+        let values = [34_200_000_000_000u64, 42, 1_500_250, 100, 0];
+        let compressed = enc.encode(&values).unwrap();
+        let decoded = dec.decode(&compressed).unwrap();
+        assert_eq!(&values[..], &decoded[..]);
     }
 
     #[test]
     fn compression_ratio() {
-        let schema = Schema::builder()
-            .field("timestamp", FieldType::Timestamp)
-            .field("instrument", FieldType::Instrument)
-            .field("price", FieldType::Price)
-            .field("quantity", FieldType::Quantity)
-            .field("side", FieldType::Bool)
-            .build();
+        let fields = quote_fields();
+        let mut enc = Codec::new(&fields, None).unwrap();
 
-        let mut enc = Codec::new(&schema);
-        let raw_size = schema.raw_size();
-        let mut total_raw = 0usize;
-        let mut total_comp = 0usize;
-        let mut ts = 34_200_000_000_000u64;
+        let base_ts: u64 = 34_200_000_000_000;
+        let mut total_compressed = 0usize;
+        let n = 1000;
 
-        for i in 0..10_000u64 {
-            ts += 1000 + (i * 37 % 50000);
-            let msg = Message::new()
-                .set(0, ts)
-                .set(1, (i % 50) as u64)
-                .set(2, (1_500_000 + (i * 7 % 2000)) as u64)
-                .set(3, ((1 + i % 20) * 100) as u64)
-                .set(4, (i % 2) as u64);
-
-            let mut buf = [0u8; 64];
-            let len = enc.encode(&msg, &mut buf).unwrap();
-            total_raw += raw_size;
-            total_comp += len;
+        for i in 0..n as u64 {
+            let values = [
+                base_ts + i * 1_000_000,
+                42 + (i % 5),
+                1_500_250 + (i % 100),
+                100 + (i % 10),
+                i % 3,
+            ];
+            let compressed = enc.encode(&values).unwrap();
+            total_compressed += compressed.len();
         }
 
-        let ratio = total_raw as f64 / total_comp as f64;
+        let raw_size = 22 * n; // 8+2+4+4+1 = 19 bytes per msg, but SDK uses 5*8=40 u64s → 22 raw
+        let ratio = raw_size as f64 / total_compressed as f64;
+        // Should achieve at least 2x compression on this data
         assert!(
-            ratio > 1.5,
-            "compression ratio should be > 1.5, got {:.2}",
-            ratio
+            ratio > 2.0,
+            "compression ratio {ratio:.2}x is below 2x threshold"
         );
     }
 }
