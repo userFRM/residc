@@ -12,9 +12,15 @@ Structure-agnostic: you define any message struct, map fields to prediction type
 
 ```
                 Raw    Compressed   Ratio    Errors
-ITCH 5.0      32.2 B    9.9 B     3.27:1      0     (8M real NASDAQ messages)
 Quotes        27.0 B   11.6 B     2.34:1      0     (100K synthetic quotes)
 Orders        43.7 B   13.4 B     3.26:1      0     (2M synthetic order flow)
+```
+
+#### External Benchmarks (not reproducible from this repo)
+
+```
+                Raw    Compressed   Ratio    Errors
+ITCH 5.0      32.2 B    9.9 B     3.27:1      0     (8M real NASDAQ messages)
 ```
 
 ### Latency
@@ -83,15 +89,17 @@ FAST (FIX Adapted for STreaming) was the FIX Trading Community's answer to this 
 
 - **Prediction quality**: FAST uses simple delta. residc uses EMA (timestamps), MFU tables (instruments), per-instrument tracking (prices), regime detection (adaptive k). Better predictions = smaller residuals.
 - **Coding efficiency**: FAST uses stop-bit coding (7 useful bits per byte). residc uses tiered variable-width codes at bit granularity. More compact for small values.
-- **Simplicity**: residc is two C files (1500 lines) or one Rust crate (1260 lines). FAST implementations are typically 10-50K lines.
+- **Simplicity**: residc is two C files (1,661 lines) or one Rust crate (1,194 lines excl. tests). FAST implementations are typically 10-50K lines.
 - **Status**: FAST is being deprecated. CME discontinued FAST feeds in 2023. SBE replaced it for low-latency; residc fills the compression niche that FAST left behind.
 
 ## Implementations
 
+> **Note:** The C and Rust implementations use different wire formats and are not interoperable. The C implementation is the canonical wire format, used by the SDK. See [Wire Format Specification](doc/WIRE_FORMAT.md).
+
 | | C | Rust |
 |--|---|------|
 | Files | `core/residc.h` + `core/residc.c` | `rust/src/` (4 modules) |
-| Lines | 1,498 | 1,261 |
+| Lines | 1,661 | 1,591 (1,194 without tests) |
 | Dependencies | 0 | 0 |
 | `no_std` | N/A | Yes |
 | Heap allocations | 0 | 0 |
@@ -172,7 +180,7 @@ assert_eq!(decoded.get(2), 1_500_250);
 | Type | Prediction Strategy | Use for |
 |------|-------------------|---------|
 | `Timestamp` | EMA of inter-message gaps + adaptive k | Nanosecond timestamps |
-| `Instrument` | MFU table (top 64 by frequency) | Security/instrument IDs |
+| `Instrument` | MFU table (top 256 by frequency) | Security/instrument IDs |
 | `Price` | Per-instrument last price + penny normalization | Fixed-point prices |
 | `Quantity` | Per-instrument last qty + zero-residual flag + round-lot | Share/lot quantities |
 | `SequentialId` | Delta from last (per-instrument or global) + adaptive k | Order IDs, execution IDs |

@@ -4,7 +4,7 @@
 //!
 //! `no_std`, zero-dependency, zero-allocation encode/decode.
 //!
-//! Compresses financial messages (quotes, orders, trades) 3-4x by predicting
+//! Compresses financial messages (quotes, orders, trades) 2-3x by predicting
 //! each field from context and encoding only the prediction error. Unlike
 //! general-purpose compressors (LZ4, zstd), it works on individual messages —
 //! no blocks, no buffering, per-message random access.
@@ -46,8 +46,8 @@ mod residual;
 
 pub const MAX_FIELDS: usize = 32;
 pub const MAX_INSTRUMENTS: usize = 16384;
-pub const MFU_SIZE: usize = 64;
-pub const MFU_INDEX_BITS: u32 = 6;
+pub const MFU_SIZE: usize = 256;
+pub const MFU_INDEX_BITS: u32 = 8;
 pub const ADAPT_WINDOW: u32 = 8;
 pub const REGIME_WINDOW: u32 = 64;
 pub const FRAME_LITERAL: u8 = 0xFF;
@@ -337,21 +337,12 @@ impl Codec {
 
     #[inline(always)]
     fn instrument_state(&self, id: u16) -> &InstrumentState {
-        debug_assert!(
-            (id as usize) < MAX_INSTRUMENTS,
-            "instrument ID {} exceeds MAX_INSTRUMENTS ({})", id, MAX_INSTRUMENTS
-        );
-        // SAFETY: id is masked to MAX_INSTRUMENTS range
-        unsafe { self.instruments.get_unchecked((id as usize) & (MAX_INSTRUMENTS - 1)) }
+        &self.instruments[(id as usize) & (MAX_INSTRUMENTS - 1)]
     }
 
     #[inline(always)]
     fn instrument_state_mut(&mut self, id: u16) -> &mut InstrumentState {
-        debug_assert!(
-            (id as usize) < MAX_INSTRUMENTS,
-            "instrument ID {} exceeds MAX_INSTRUMENTS ({})", id, MAX_INSTRUMENTS
-        );
-        unsafe { self.instruments.get_unchecked_mut((id as usize) & (MAX_INSTRUMENTS - 1)) }
+        &mut self.instruments[(id as usize) & (MAX_INSTRUMENTS - 1)]
     }
 
     // ============================================================
@@ -362,15 +353,16 @@ impl Codec {
         if out.len() < 2 { return Err("buffer too small"); }
 
         // Single-pass: encode fields + update state in one loop
-        let payload_len = {
+        let (payload_len, overflow) = {
             let mut bw = bits::BitWriter::new(&mut out[1..]);
             self.encode_and_commit(msg, &mut bw);
-            bw.finish()
+            let overflow = bw.overflow;
+            (bw.finish(), overflow)
         };
 
         let raw_size = self.schema.raw_size();
 
-        if payload_len >= raw_size || payload_len >= 254 {
+        if overflow || payload_len >= raw_size || payload_len >= 254 {
             // State already committed — just overwrite with literal bytes
             let total = 1 + raw_size;
             if out.len() < total { return Err("buffer too small for literal"); }
@@ -408,7 +400,7 @@ impl Codec {
         let k_seq = self.k_seq();
 
         for fi in 0..self.schema.num_fields {
-            // SAFETY: fi < num_fields <= MAX_FIELDS
+            // SAFETY: fi < num_fields <= MAX_FIELDS, both arrays are [_; MAX_FIELDS]
             let fd = unsafe { *self.schema.fields.get_unchecked(fi) };
             let val = unsafe { *msg.values.get_unchecked(fi) };
 
@@ -742,7 +734,7 @@ impl Codec {
         let mut instrument_id = self.last_instrument;
 
         for fi in 0..self.schema.num_fields {
-            // SAFETY: fi < num_fields <= MAX_FIELDS
+            // SAFETY: fi < num_fields <= MAX_FIELDS, both arrays are [_; MAX_FIELDS]
             let fd = unsafe { *self.schema.fields.get_unchecked(fi) };
             let val = unsafe { *msg.values.get_unchecked(fi) };
 

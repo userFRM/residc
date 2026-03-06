@@ -5,12 +5,13 @@ pub struct BitWriter<'a> {
     accum: u64,
     bits_in_accum: u32,
     byte_pos: usize,
+    pub overflow: bool,
 }
 
 impl<'a> BitWriter<'a> {
     #[inline]
     pub fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, accum: 0, bits_in_accum: 0, byte_pos: 0 }
+        Self { buf, accum: 0, bits_in_accum: 0, byte_pos: 0, overflow: false }
     }
 
     /// Write bits to the accumulator. Fast path for <= 57 bits (covers all
@@ -18,6 +19,7 @@ impl<'a> BitWriter<'a> {
     #[inline(always)]
     pub fn write(&mut self, value: u64, num_bits: u32) {
         debug_assert!(num_bits <= 64);
+        if self.overflow { return; }
 
         if num_bits + self.bits_in_accum <= 64 {
             // Fast path: fits in accumulator.
@@ -29,6 +31,11 @@ impl<'a> BitWriter<'a> {
             // Flush complete bytes
             while self.bits_in_accum >= 8 {
                 self.bits_in_accum -= 8;
+                if self.byte_pos >= self.buf.len() {
+                    self.overflow = true;
+                    return;
+                }
+                // SAFETY: byte_pos < buf.len() checked above
                 unsafe {
                     *self.buf.as_mut_ptr().add(self.byte_pos) =
                         (self.accum >> self.bits_in_accum) as u8;
@@ -49,6 +56,11 @@ impl<'a> BitWriter<'a> {
     #[inline]
     pub fn finish(mut self) -> usize {
         if self.bits_in_accum > 0 {
+            if self.byte_pos >= self.buf.len() {
+                self.overflow = true;
+                return self.byte_pos;
+            }
+            // SAFETY: byte_pos < buf.len() checked above
             unsafe {
                 *self.buf.as_mut_ptr().add(self.byte_pos) =
                     (self.accum << (8 - self.bits_in_accum)) as u8;
@@ -77,7 +89,7 @@ impl<'a> BitReader<'a> {
     #[inline(always)]
     fn refill(&mut self, need: u32) {
         while self.bits_in_accum < need && self.byte_pos < self.data.len() {
-            let byte = unsafe { *self.data.as_ptr().add(self.byte_pos) };
+            let byte = self.data[self.byte_pos];
             self.accum = (self.accum << 8) | byte as u64;
             self.bits_in_accum += 8;
             self.byte_pos += 1;

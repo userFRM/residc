@@ -59,6 +59,10 @@ residc_codec_t *residc_codec_create(const int *types, const int8_t *ref_fields,
     }
 
     c->msg_size = offset;
+    if (c->msg_size > 256) {
+        free(c);
+        return NULL;
+    }
     c->schema.fields = c->fields;
     c->schema.num_fields = num_fields;
     c->schema.msg_size = c->msg_size;
@@ -109,6 +113,7 @@ static void unpack_values(const residc_codec_t *c, const uint8_t *msg,
 int residc_codec_encode(residc_codec_t *codec, const uint64_t *values,
                         uint8_t *out, int capacity)
 {
+    if (!codec || !values || !out) return -1;
     uint8_t msg[256];
     memset(msg, 0, (size_t)codec->msg_size);
     pack_values(codec, values, msg);
@@ -118,6 +123,7 @@ int residc_codec_encode(residc_codec_t *codec, const uint64_t *values,
 int residc_codec_decode(residc_codec_t *codec, const uint8_t *in, int in_len,
                         uint64_t *values)
 {
+    if (!codec || !in || !values) return -1;
     uint8_t msg[256];
     memset(msg, 0, (size_t)codec->msg_size);
     int consumed = residc_decode(&codec->state, in, in_len, msg);
@@ -128,6 +134,7 @@ int residc_codec_decode(residc_codec_t *codec, const uint8_t *in, int in_len,
 
 residc_codec_t *residc_codec_snapshot(const residc_codec_t *codec)
 {
+    if (!codec) return NULL;
     residc_codec_t *snap = (residc_codec_t *)malloc(sizeof(*snap));
     if (!snap) return NULL;
     memcpy(snap, codec, sizeof(*snap));
@@ -139,6 +146,7 @@ residc_codec_t *residc_codec_snapshot(const residc_codec_t *codec)
 
 void residc_codec_restore(residc_codec_t *codec, const residc_codec_t *snap)
 {
+    if (!codec || !snap) return;
     /* Copy state from snapshot, preserve our own schema setup */
     residc_state_t *s = &codec->state;
     const residc_schema_t *saved_schema = s->schema;
@@ -148,11 +156,13 @@ void residc_codec_restore(residc_codec_t *codec, const residc_codec_t *snap)
 
 void residc_codec_reset(residc_codec_t *codec)
 {
+    if (!codec) return;
     residc_reset(&codec->state);
 }
 
 void residc_codec_seed_mfu(residc_codec_t *codec, const uint16_t *ids,
                            const uint16_t *counts, int n)
 {
+    if (!codec || !ids || !counts) return;
     residc_mfu_seed(&codec->state.mfu, ids, counts, n);
 }

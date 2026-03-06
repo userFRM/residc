@@ -1,7 +1,7 @@
 use crate::MFU_SIZE;
 
-const HASH_SIZE: usize = 256;
-const HASH_EMPTY: u8 = 0xFF;
+const HASH_SIZE: usize = 512;
+const HASH_EMPTY: u16 = 0xFFFF;
 
 /// Entry in the Most-Frequently-Used instrument table.
 #[derive(Clone, Copy)]
@@ -12,14 +12,14 @@ pub struct MfuEntry {
 
 /// Most-Frequently-Used instrument table with hash acceleration.
 ///
-/// Tracks the top-N instruments by frequency. Uses a 256-entry hash table
+/// Tracks the top-N instruments by frequency. Uses a 512-entry hash table
 /// for O(1) lookup (matching the C implementation's hash+chain approach).
 #[derive(Clone)]
 pub struct MfuTable {
     pub entries: [MfuEntry; MFU_SIZE],
     len: usize,
-    /// hash[id & 0xFF] = index into entries[], or HASH_EMPTY if no mapping
-    hash: [u8; HASH_SIZE],
+    /// hash[id & (HASH_SIZE-1)] = index into entries[], or HASH_EMPTY if no mapping
+    hash: [u16; HASH_SIZE],
 }
 
 impl MfuTable {
@@ -40,17 +40,17 @@ impl MfuTable {
     #[inline(always)]
     pub fn lookup(&self, id: u16) -> Option<usize> {
         let h = Self::hash_of(id);
-        let idx = unsafe { *self.hash.get_unchecked(h) };
+        let idx = self.hash[h];
         if idx != HASH_EMPTY {
             let i = idx as usize;
-            if unsafe { self.entries.get_unchecked(i) }.id == id {
+            if self.entries[i].id == id {
                 return Some(i);
             }
         }
         // Hash miss or collision — linear scan fallback
         let len = self.len;
         for i in 0..len {
-            if unsafe { self.entries.get_unchecked(i) }.id == id {
+            if self.entries[i].id == id {
                 return Some(i);
             }
         }
@@ -86,8 +86,8 @@ impl MfuTable {
                 let id_a = self.entries[pos].id;
                 let id_b = self.entries[pos - 1].id;
                 self.entries.swap(pos, pos - 1);
-                self.hash[Self::hash_of(id_a)] = (pos - 1) as u8;
-                self.hash[Self::hash_of(id_b)] = pos as u8;
+                self.hash[Self::hash_of(id_a)] = (pos - 1) as u16;
+                self.hash[Self::hash_of(id_b)] = pos as u16;
                 pos -= 1;
             }
             return;
@@ -97,7 +97,7 @@ impl MfuTable {
         if self.len < MFU_SIZE {
             let idx = self.len;
             self.entries[idx] = MfuEntry { id, count: 1 };
-            self.hash[h] = idx as u8;
+            self.hash[h] = idx as u16;
             self.len += 1;
         } else {
             // Replace the last (least frequent) entry
@@ -105,11 +105,11 @@ impl MfuTable {
             // Clear hash for old entry
             let old_id = self.entries[last].id;
             let old_h = Self::hash_of(old_id);
-            if self.hash[old_h] == last as u8 {
+            if self.hash[old_h] == last as u16 {
                 self.hash[old_h] = HASH_EMPTY;
             }
             self.entries[last] = MfuEntry { id, count: 1 };
-            self.hash[h] = last as u8;
+            self.hash[h] = last as u16;
         }
     }
 
@@ -123,7 +123,7 @@ impl MfuTable {
             let (id, count) = instruments[i];
             self.entries[i] = MfuEntry { id, count };
             let h = Self::hash_of(id);
-            self.hash[h] = i as u8;
+            self.hash[h] = i as u16;
         }
         self.len = n;
     }

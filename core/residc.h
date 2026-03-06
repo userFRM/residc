@@ -85,7 +85,7 @@ extern "C" {
 
 /* MFU table size (most-frequently-used instruments) */
 #ifndef RESIDC_MFU_SIZE
-#define RESIDC_MFU_SIZE         64
+#define RESIDC_MFU_SIZE         256
 #endif
 
 /* Maximum fields per schema */
@@ -105,7 +105,7 @@ extern "C" {
 
 /* Scratch buffer for bit packing */
 #ifndef RESIDC_SCRATCH_BYTES
-#define RESIDC_SCRATCH_BYTES    128
+#define RESIDC_SCRATCH_BYTES    256
 #endif
 
 /* Regime detection window */
@@ -114,7 +114,7 @@ extern "C" {
 #endif
 
 /* MFU index bits (log2 of RESIDC_MFU_SIZE) */
-#define RESIDC_MFU_INDEX_BITS   6
+#define RESIDC_MFU_INDEX_BITS   8
 
 /* Regime types */
 #define RESIDC_REGIME_CALM      0
@@ -142,7 +142,7 @@ typedef enum {
     /*
      * INSTRUMENT — instrument/security identifier (uint16)
      * Prediction: MFU (most-frequently-used) table
-     * Encoding: 1-bit same flag, or MFU index (6 bits), or raw (14 bits)
+     * Encoding: 1-bit same flag, or MFU index (8 bits), or raw (14 bits)
      * Typical savings: 60-70% (a few instruments dominate trading)
      */
     RESIDC_INSTRUMENT = 1,
@@ -296,9 +296,9 @@ typedef struct {
 /* MFU table */
 typedef struct {
     residc_mfu_entry_t entries[RESIDC_MFU_SIZE];
-    uint8_t            num_entries;
-    uint8_t            hash[256];
-    uint8_t            chain[RESIDC_MFU_SIZE];
+    uint16_t           num_entries;
+    uint16_t           hash[256];
+    uint16_t           chain[RESIDC_MFU_SIZE];
 } residc_mfu_table_t;
 
 /* Per-field adaptive state */
@@ -496,7 +496,7 @@ void    residc_mfu_update(residc_mfu_table_t *mfu, uint16_t id);
  *
  * For gap recovery: snapshot codec state periodically, restore
  * and replay from the snapshot if messages are lost.
- * The snapshot is a full copy of the state struct (~330KB).
+ * The snapshot is a full copy of the state struct (~332KB).
  * ================================================================ */
 
 /*

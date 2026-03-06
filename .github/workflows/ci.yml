@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  c-build:
+    name: C (gcc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build benchmark
+        run: cc -O2 -Wall -Wextra -o bench_quote bench/bench_quote.c core/residc.c -Icore
+
+      - name: Run benchmark (verify correctness)
+        run: ./bench_quote
+
+      - name: Build SDK
+        run: make -C sdk
+
+      - name: Run Python SDK example
+        run: |
+          cp sdk/libresdc.so sdk/python/residc/
+          python3 sdk/python/example.py
+
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Check formatting
+        working-directory: rust
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy -- -D warnings
+
+      - name: Tests
+        working-directory: rust
+        run: cargo test
+
+      - name: Benchmark (compile check only)
+        working-directory: rust
+        run: cargo bench --no-run

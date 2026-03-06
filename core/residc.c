@@ -41,6 +41,7 @@ void residc_bw_init(residc_bitwriter_t *bw)
 static void bw_flush(residc_bitwriter_t *bw)
 {
     while (bw->count >= 8) {
+        if (bw->byte_pos >= RESIDC_SCRATCH_BYTES) return;
         bw->count -= 8;
         bw->buf[bw->byte_pos++] = (uint8_t)(bw->accum >> bw->count);
     }
@@ -61,6 +62,7 @@ void bw_write(residc_bitwriter_t *bw, uint64_t val, int nbits)
     bw->accum = (bw->accum << nbits) | (val & ((1ULL << nbits) - 1));
     bw->count += nbits;
     while (__builtin_expect(bw->count >= 8, 0)) {
+        if (bw->byte_pos >= RESIDC_SCRATCH_BYTES) return;
         bw->count -= 8;
         bw->buf[bw->byte_pos++] = (uint8_t)(bw->accum >> bw->count);
     }
@@ -70,7 +72,7 @@ int residc_bw_finish(residc_bitwriter_t *bw)
 {
     if (__builtin_expect(bw->count >= 8, 1))
         bw_flush(bw);
-    if (bw->count > 0) {
+    if (bw->count > 0 && bw->byte_pos < RESIDC_SCRATCH_BYTES) {
         bw->buf[bw->byte_pos++] =
             (uint8_t)(bw->accum << (8 - bw->count));
     }
@@ -271,15 +273,17 @@ void residc_adaptive_update(uint64_t *sum, uint32_t *count, uint64_t val)
 void residc_mfu_init(residc_mfu_table_t *mfu)
 {
     memset(mfu, 0, sizeof(*mfu));
-    memset(mfu->hash, 0xFF, sizeof(mfu->hash));
-    memset(mfu->chain, 0xFF, sizeof(mfu->chain));
+    for (int i = 0; i < 256; i++)
+        mfu->hash[i] = 0xFFFF;
+    for (int i = 0; i < RESIDC_MFU_SIZE; i++)
+        mfu->chain[i] = 0xFFFF;
 }
 
 int residc_mfu_lookup(const residc_mfu_table_t *mfu, uint16_t id)
 {
     uint8_t h = (uint8_t)(id * 157);  /* simple hash */
-    uint8_t idx = mfu->hash[h];
-    while (idx != 0xFF) {
+    uint16_t idx = mfu->hash[h];
+    while (idx != 0xFFFF) {
         if (mfu->entries[idx].instrument_id == id)
             return (int)idx;
         idx = mfu->chain[idx];
@@ -310,9 +314,9 @@ void residc_mfu_update(residc_mfu_table_t *mfu, uint16_t id)
         }
         /* Remove old entry from hash chain */
         uint8_t old_h = (uint8_t)(mfu->entries[min_idx].instrument_id * 157);
-        uint8_t *pp = &mfu->hash[old_h];
-        while (*pp != 0xFF) {
-            if (*pp == (uint8_t)min_idx) {
+        uint16_t *pp = &mfu->hash[old_h];
+        while (*pp != 0xFFFF) {
+            if (*pp == (uint16_t)min_idx) {
                 *pp = mfu->chain[min_idx];
                 break;
             }
@@ -327,7 +331,7 @@ void residc_mfu_update(residc_mfu_table_t *mfu, uint16_t id)
     /* Insert into hash chain */
     uint8_t h = (uint8_t)(id * 157);
     mfu->chain[idx] = mfu->hash[h];
-    mfu->hash[h] = (uint8_t)idx;
+    mfu->hash[h] = (uint16_t)idx;
 }
 
 /* Periodic decay to adapt to changing instrument distributions */
@@ -430,9 +434,9 @@ void residc_mfu_seed(residc_mfu_table_t *mfu, const uint16_t *ids,
         mfu->entries[i].count = counts[i];
         uint8_t h = (uint8_t)(ids[i] * 157);
         mfu->chain[i] = mfu->hash[h];
-        mfu->hash[h] = (uint8_t)i;
+        mfu->hash[h] = (uint16_t)i;
     }
-    mfu->num_entries = (uint8_t)to_add;
+    mfu->num_entries = (uint16_t)to_add;
 }
 
 int residc_raw_size(const residc_schema_t *schema)
@@ -475,7 +479,7 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
                                    &state->ts_adapt_count, zz);
 
             /* Update EMA: ema = ema + (gap - ema) / 4 in Q16 */
-            int64_t gap_q16 = gap << 16;
+            int64_t gap_q16 = (int64_t)((uint64_t)gap << 16);
             state->timestamp_gap_ema +=
                 (gap_q16 - state->timestamp_gap_ema) >> 2;
             state->last_timestamp = ts;
@@ -526,7 +530,7 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
             }
 
             /* Regime tracking */
-            uint64_t abs_res = (uint64_t)(residual < 0 ? -residual : residual);
+            uint64_t abs_res = (uint64_t)(residual < 0 ? -(uint64_t)residual : (uint64_t)residual);
             state->recent_abs_price_sum += (uint32_t)abs_res;
             state->regime_counter++;
             if (state->regime_counter >= RESIDC_REGIME_WINDOW) {
@@ -772,7 +776,7 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
             residc_adaptive_update(&state->ts_adapt_sum,
                                    &state->ts_adapt_count, zz);
 
-            int64_t gap_q16 = gap << 16;
+            int64_t gap_q16 = (int64_t)((uint64_t)gap << 16);
             state->timestamp_gap_ema +=
                 (gap_q16 - state->timestamp_gap_ema) >> 2;
             state->last_timestamp = val;
@@ -815,7 +819,7 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
 
             /* Regime tracking */
             int64_t full_res = (int64_t)price - (int64_t)predicted;
-            uint64_t abs_res = (uint64_t)(full_res < 0 ? -full_res : full_res);
+            uint64_t abs_res = (uint64_t)(full_res < 0 ? -(uint64_t)full_res : (uint64_t)full_res);
             state->recent_abs_price_sum += (uint32_t)abs_res;
             state->regime_counter++;
             if (state->regime_counter >= RESIDC_REGIME_WINDOW) {
