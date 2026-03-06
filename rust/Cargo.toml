@@ -1,0 +1,23 @@
+[package]
+name = "residc"
+version = "0.1.0"
+edition = "2024"
+description = "Per-message prediction-residual compression for financial data"
+license = "MIT"
+repository = "https://github.com/theta-gamma/residc"
+keywords = ["compression", "financial", "market-data", "itch", "low-latency"]
+categories = ["compression", "encoding", "finance"]
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "codec_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

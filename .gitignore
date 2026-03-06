@@ -3,3 +3,7 @@
 *.a
 *.dylib
 examples/custom/quote_example
+
+# Rust
+rust/target/
+Cargo.lock
