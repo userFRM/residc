@@ -2,6 +2,8 @@
 //!
 //! **Per-message prediction-residual compression for financial data.**
 //!
+//! `no_std`, zero-dependency, zero-allocation encode/decode.
+//!
 //! Compresses financial messages (quotes, orders, trades) 3-4x by predicting
 //! each field from context and encoding only the prediction error. Unlike
 //! general-purpose compressors (LZ4, zstd), it works on individual messages —
@@ -35,6 +37,8 @@
 //! let decoded = dec.decode(&buf[..len]).unwrap();
 //! assert_eq!(decoded.get(2), 1_500_250);
 //! ```
+
+#![no_std]
 
 mod bits;
 mod mfu;
@@ -81,47 +85,71 @@ pub enum FieldType {
 }
 
 // ================================================================
-// Schema
+// Schema (fixed-size, no heap)
 // ================================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct FieldDef {
     pub name: &'static str,
     pub field_type: FieldType,
 }
 
+const EMPTY_FIELD: FieldDef = FieldDef { name: "", field_type: FieldType::Computed };
+
 #[derive(Clone, Debug)]
 pub struct Schema {
-    pub fields: Vec<FieldDef>,
+    fields: [FieldDef; MAX_FIELDS],
+    num_fields: usize,
+    raw_size: usize,
 }
 
 pub struct SchemaBuilder {
-    fields: Vec<FieldDef>,
+    fields: [FieldDef; MAX_FIELDS],
+    num_fields: usize,
 }
 
 impl Schema {
     pub fn builder() -> SchemaBuilder {
-        SchemaBuilder { fields: Vec::new() }
+        SchemaBuilder {
+            fields: [EMPTY_FIELD; MAX_FIELDS],
+            num_fields: 0,
+        }
     }
 
+    #[inline]
     pub fn num_fields(&self) -> usize {
-        self.fields.len()
+        self.num_fields
     }
 
-    /// Raw (uncompressed) byte size based on field types.
+    #[inline]
     pub fn raw_size(&self) -> usize {
-        self.fields.iter().map(|f| field_raw_bytes(f.field_type)).sum()
+        self.raw_size
+    }
+
+    #[inline]
+    pub fn field(&self, index: usize) -> &FieldDef {
+        &self.fields[index]
     }
 }
 
 impl SchemaBuilder {
     pub fn field(mut self, name: &'static str, field_type: FieldType) -> Self {
-        self.fields.push(FieldDef { name, field_type });
+        assert!(self.num_fields < MAX_FIELDS, "too many fields");
+        self.fields[self.num_fields] = FieldDef { name, field_type };
+        self.num_fields += 1;
         self
     }
 
     pub fn build(self) -> Schema {
-        Schema { fields: self.fields }
+        let mut raw_size = 0;
+        for i in 0..self.num_fields {
+            raw_size += field_raw_bytes(self.fields[i].field_type);
+        }
+        Schema {
+            fields: self.fields,
+            num_fields: self.num_fields,
+            raw_size,
+        }
     }
 }
 
@@ -180,10 +208,10 @@ impl Default for Message {
 }
 
 // ================================================================
-// Codec state
+// Codec state (fully stack-allocated, ~330KB)
 // ================================================================
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct InstrumentState {
     last_price: u32,
     last_qty: u32,
@@ -191,17 +219,19 @@ struct InstrumentState {
     last_seq_id: u64,
 }
 
-impl Default for InstrumentState {
-    fn default() -> Self {
-        Self { last_price: 0, last_qty: 0, msg_count: 0, last_seq_id: 0 }
-    }
+impl InstrumentState {
+    const ZERO: Self = Self { last_price: 0, last_qty: 0, msg_count: 0, last_seq_id: 0 };
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy)]
 struct FieldState {
     last_value: u64,
     adapt_sum: u64,
     adapt_count: u32,
+}
+
+impl FieldState {
+    const ZERO: Self = Self { last_value: 0, adapt_sum: 0, adapt_count: 0 };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -213,7 +243,7 @@ pub struct Codec {
 
     // Timestamp
     last_timestamp: u64,
-    ts_gap_ema: i64,   // Q16
+    ts_gap_ema: i64,
     ts_adapt_sum: u64,
     ts_adapt_count: u32,
 
@@ -230,9 +260,8 @@ pub struct Codec {
     // Per-field
     field_state: [FieldState; MAX_FIELDS],
 
-    // Per-instrument
-    instruments: Vec<InstrumentState>,
-
+    // Per-instrument (fixed array, no heap)
+    instruments: [InstrumentState; MAX_INSTRUMENTS],
 }
 
 impl Codec {
@@ -250,10 +279,8 @@ impl Codec {
             regime: Regime::Calm,
             regime_counter: 0,
             recent_abs_price_sum: 0,
-            field_state: core::array::from_fn(|_| FieldState::default()),
-            instruments: (0..MAX_INSTRUMENTS)
-                .map(|_| InstrumentState::default())
-                .collect(),
+            field_state: [FieldState::ZERO; MAX_FIELDS],
+            instruments: [InstrumentState::ZERO; MAX_INSTRUMENTS],
         }
     }
 
@@ -261,28 +288,35 @@ impl Codec {
         *self = Self::new(&self.schema);
     }
 
+    #[inline(always)]
     fn k_ts(&self) -> u32 {
         if self.regime == Regime::Volatile { 8 } else { 10 }
     }
 
+    #[inline(always)]
     fn k_price(&self) -> u32 {
         if self.regime == Regime::Volatile { 7 } else { 3 }
     }
 
+    #[inline(always)]
     fn k_qty(&self) -> u32 {
         if self.regime == Regime::Volatile { 7 } else { 4 }
     }
 
+    #[inline(always)]
     fn k_seq(&self) -> u32 {
         if self.regime == Regime::Volatile { 5 } else { 3 }
     }
 
-    fn instrument_state(&self, id: u16) -> Option<&InstrumentState> {
-        if (id as usize) < MAX_INSTRUMENTS {
-            Some(&self.instruments[id as usize])
-        } else {
-            None
-        }
+    #[inline(always)]
+    fn instrument_state(&self, id: u16) -> &InstrumentState {
+        // SAFETY: id is masked to MAX_INSTRUMENTS range
+        unsafe { self.instruments.get_unchecked((id as usize) & (MAX_INSTRUMENTS - 1)) }
+    }
+
+    #[inline(always)]
+    fn instrument_state_mut(&mut self, id: u16) -> &mut InstrumentState {
+        unsafe { self.instruments.get_unchecked_mut((id as usize) & (MAX_INSTRUMENTS - 1)) }
     }
 
     // ============================================================
@@ -299,12 +333,12 @@ impl Codec {
         let raw_size = self.schema.raw_size();
 
         if payload_len >= raw_size || payload_len >= 254 {
-            // Literal fallback
             let total = 1 + raw_size;
             if out.len() < total { return Err("buffer too small for literal"); }
             out[0] = FRAME_LITERAL;
             let mut pos = 1;
-            for (fi, fd) in self.schema.fields.iter().enumerate() {
+            for fi in 0..self.schema.num_fields {
+                let fd = &self.schema.fields[fi];
                 if matches!(fd.field_type, FieldType::Computed) { continue; }
                 let val = msg.values[fi];
                 let bytes = field_raw_bytes(fd.field_type);
@@ -317,7 +351,6 @@ impl Codec {
             return Ok(pos);
         }
 
-        // Compressed frame
         let total = 1 + payload_len;
         if out.len() < total { return Err("buffer too small"); }
         out[0] = payload_len as u8;
@@ -326,24 +359,23 @@ impl Codec {
         Ok(total)
     }
 
+    #[inline]
     fn encode_fields(&self, msg: &Message, bw: &mut bits::BitWriter) {
-        let mut is: Option<&InstrumentState> = None;
+        let mut is: &InstrumentState = &InstrumentState::ZERO;
 
-        for (fi, fd) in self.schema.fields.iter().enumerate() {
+        for fi in 0..self.schema.num_fields {
+            let fd = &self.schema.fields[fi];
             let val = msg.values[fi];
 
             match fd.field_type {
                 FieldType::Timestamp => {
-                    let ts = val;
-                    let gap = ts.wrapping_sub(self.last_timestamp) as i64;
+                    let gap = val.wrapping_sub(self.last_timestamp) as i64;
                     let predicted_gap = (self.ts_gap_ema >> 16).max(0);
-                    let res = gap - predicted_gap;
-
                     let k = residual::adaptive_k(
                         self.ts_adapt_sum, self.ts_adapt_count,
                         self.k_ts(), self.k_ts() + 10,
                     );
-                    residual::encode(bw, res, k);
+                    residual::encode(bw, gap - predicted_gap, k);
                 }
 
                 FieldType::Instrument => {
@@ -369,30 +401,24 @@ impl Codec {
 
                 FieldType::Price => {
                     let price = val as u32;
-                    let predicted = match is {
-                        Some(s) if s.msg_count > 0 => s.last_price,
-                        _ => 0,
-                    };
+                    let predicted = if is.msg_count > 0 { is.last_price } else { 0 };
                     let res = price as i64 - predicted as i64;
                     let k = self.k_price();
 
                     if price % 100 == 0 && predicted % 100 == 0
                         && (price > 0 || predicted > 0)
                     {
-                        bw.write(0, 1); // penny mode
+                        bw.write(0, 1);
                         residual::encode(bw, res / 100, k);
                     } else {
-                        bw.write(1, 1); // sub-penny
+                        bw.write(1, 1);
                         residual::encode(bw, res, k);
                     }
                 }
 
                 FieldType::Quantity => {
                     let qty = val as u32;
-                    let predicted = match is {
-                        Some(s) if s.msg_count > 0 => s.last_qty,
-                        _ => 100,
-                    };
+                    let predicted = if is.msg_count > 0 { is.last_qty } else { 100 };
                     let res = qty as i64 - predicted as i64;
                     let k = self.k_qty();
 
@@ -412,10 +438,7 @@ impl Codec {
 
                 FieldType::SequentialId => {
                     let fs = &self.field_state[fi];
-                    let predicted = match is {
-                        Some(s) if s.last_seq_id > 0 => s.last_seq_id,
-                        _ => fs.last_value,
-                    };
+                    let predicted = if is.last_seq_id > 0 { is.last_seq_id } else { fs.last_value };
                     let delta = val.wrapping_sub(predicted) as i64;
                     let k = residual::adaptive_k(
                         fs.adapt_sum, fs.adapt_count,
@@ -482,7 +505,8 @@ impl Codec {
 
         if frame == FRAME_LITERAL {
             let mut pos = 1;
-            for (fi, fd) in self.schema.fields.iter().enumerate() {
+            for fi in 0..self.schema.num_fields {
+                let fd = &self.schema.fields[fi];
                 if matches!(fd.field_type, FieldType::Computed) { continue; }
                 let bytes = field_raw_bytes(fd.field_type);
                 let mut val = 0u64;
@@ -506,10 +530,12 @@ impl Codec {
         Ok(msg)
     }
 
+    #[inline]
     fn decode_fields(&self, br: &mut bits::BitReader, msg: &mut Message) {
-        let mut is: Option<&InstrumentState> = None;
+        let mut is: &InstrumentState = &InstrumentState::ZERO;
 
-        for (fi, fd) in self.schema.fields.iter().enumerate() {
+        for fi in 0..self.schema.num_fields {
+            let fd = &self.schema.fields[fi];
             let val: u64 = match fd.field_type {
                 FieldType::Timestamp => {
                     let predicted_gap = (self.ts_gap_ema >> 16).max(0);
@@ -536,10 +562,7 @@ impl Codec {
                 }
 
                 FieldType::Price => {
-                    let predicted = match is {
-                        Some(s) if s.msg_count > 0 => s.last_price,
-                        _ => 0,
-                    };
+                    let predicted = if is.msg_count > 0 { is.last_price } else { 0 };
                     let k = self.k_price();
                     let mode = br.read_bit();
                     let res = residual::decode(br, k);
@@ -551,10 +574,7 @@ impl Codec {
                 }
 
                 FieldType::Quantity => {
-                    let predicted = match is {
-                        Some(s) if s.msg_count > 0 => s.last_qty,
-                        _ => 100,
-                    };
+                    let predicted = if is.msg_count > 0 { is.last_qty } else { 100 };
                     let k = self.k_qty();
                     if br.read_bit() == 0 {
                         predicted as u64
@@ -571,10 +591,7 @@ impl Codec {
 
                 FieldType::SequentialId => {
                     let fs = &self.field_state[fi];
-                    let predicted = match is {
-                        Some(s) if s.last_seq_id > 0 => s.last_seq_id,
-                        _ => fs.last_value,
-                    };
+                    let predicted = if is.last_seq_id > 0 { is.last_seq_id } else { fs.last_value };
                     let k = residual::adaptive_k(
                         fs.adapt_sum, fs.adapt_count,
                         self.k_seq(), self.k_seq() + 10,
@@ -633,13 +650,13 @@ impl Codec {
     fn commit_state(&mut self, msg: &Message) {
         let mut instrument_id = self.last_instrument;
 
-        for (fi, fd) in self.schema.fields.iter().enumerate() {
+        for fi in 0..self.schema.num_fields {
+            let fd = self.schema.fields[fi];
             let val = msg.values[fi];
 
             match fd.field_type {
                 FieldType::Timestamp => {
-                    let ts = val;
-                    let gap = ts.wrapping_sub(self.last_timestamp) as i64;
+                    let gap = val.wrapping_sub(self.last_timestamp) as i64;
                     let res = gap - (self.ts_gap_ema >> 16).max(0);
                     let zz = residual::zigzag_enc(res);
 
@@ -649,7 +666,7 @@ impl Codec {
 
                     let gap_q16 = gap << 16;
                     self.ts_gap_ema += (gap_q16 - self.ts_gap_ema) >> 2;
-                    self.last_timestamp = ts;
+                    self.last_timestamp = val;
                 }
 
                 FieldType::Instrument => {
@@ -664,40 +681,33 @@ impl Codec {
                 }
 
                 FieldType::Price => {
-                    if let Some(is) = self.instruments.get_mut(instrument_id as usize) {
-                        let predicted = if is.msg_count > 0 { is.last_price } else { 0 };
-                        let res = (val as i64 - predicted as i64).unsigned_abs() as u32;
-                        self.recent_abs_price_sum += res;
-                        self.regime_counter += 1;
-                        if self.regime_counter >= REGIME_WINDOW {
-                            let avg = self.recent_abs_price_sum / REGIME_WINDOW;
-                            self.regime = if avg > 30 { Regime::Volatile } else { Regime::Calm };
-                            self.recent_abs_price_sum = 0;
-                            self.regime_counter = 0;
-                        }
-                        is.last_price = val as u32;
+                    let is = self.instrument_state_mut(instrument_id);
+                    let predicted = if is.msg_count > 0 { is.last_price } else { 0 };
+                    let res = (val as i64 - predicted as i64).unsigned_abs() as u32;
+                    self.recent_abs_price_sum += res;
+                    self.regime_counter += 1;
+                    if self.regime_counter >= REGIME_WINDOW {
+                        let avg = self.recent_abs_price_sum / REGIME_WINDOW;
+                        self.regime = if avg > 30 { Regime::Volatile } else { Regime::Calm };
+                        self.recent_abs_price_sum = 0;
+                        self.regime_counter = 0;
                     }
+                    self.instrument_state_mut(instrument_id).last_price = val as u32;
                 }
 
                 FieldType::Quantity => {
-                    if let Some(is) = self.instruments.get_mut(instrument_id as usize) {
-                        is.last_qty = val as u32;
-                    }
+                    self.instrument_state_mut(instrument_id).last_qty = val as u32;
                 }
 
                 FieldType::SequentialId => {
+                    let inst_seq = self.instrument_state(instrument_id).last_seq_id;
                     let fs = &mut self.field_state[fi];
-                    let predicted = match self.instruments.get(instrument_id as usize) {
-                        Some(s) if s.last_seq_id > 0 => s.last_seq_id,
-                        _ => fs.last_value,
-                    };
+                    let predicted = if inst_seq > 0 { inst_seq } else { fs.last_value };
                     let delta = val.wrapping_sub(predicted) as i64;
                     let zz = residual::zigzag_enc(delta);
                     residual::adaptive_update(&mut fs.adapt_sum, &mut fs.adapt_count, zz);
                     fs.last_value = val;
-                    if let Some(is) = self.instruments.get_mut(instrument_id as usize) {
-                        is.last_seq_id = val;
-                    }
+                    self.instrument_state_mut(instrument_id).last_seq_id = val;
                 }
 
                 FieldType::Enum | FieldType::Categorical | FieldType::DeltaId { .. } => {
@@ -708,9 +718,7 @@ impl Codec {
             }
         }
 
-        if let Some(is) = self.instruments.get_mut(instrument_id as usize) {
-            is.msg_count += 1;
-        }
+        self.instrument_state_mut(instrument_id).msg_count += 1;
         self.msg_count += 1;
     }
 }
@@ -732,7 +740,6 @@ mod tests {
         let mut enc = Codec::new(&schema);
         let mut dec = Codec::new(&schema);
 
-        // Encode 1000 messages and verify roundtrip
         let mut ts = 34_200_000_000_000u64;
         let mut errors = 0;
 

@@ -1,8 +1,8 @@
 # residc (Rust)
 
-Zero-dependency Rust implementation of the residc prediction-residual codec for financial data.
+`#![no_std]`, zero-dependency, zero-allocation prediction-residual codec for financial data.
 
-Same wire format as the C library. A message encoded by C can be decoded by Rust and vice versa.
+Same wire format as the C library. A message encoded by C can be decoded by Rust and vice versa. Encoder and decoder can run on different machines — they stay synchronized through identical state evolution, no shared memory needed.
 
 ## Performance
 
@@ -10,26 +10,28 @@ Measured with [Criterion](https://github.com/bheisler/criterion.rs) on synthetic
 
 | Metric | Value |
 |--------|-------|
-| Encode latency | 105 ns/msg |
-| Decode latency | 54 ns/msg |
+| Encode latency | **96 ns/msg** |
+| Decode latency | **55 ns/msg** |
 | Compression ratio | 2.3:1 (19 bytes raw -> ~8 bytes compressed) |
-| Encode throughput | 181 MB/s |
-| Decode throughput | 352 MB/s |
+| Encode throughput | 198 MB/s |
+| Decode throughput | 345 MB/s |
+| `no_std` | Yes |
 | Dependencies | 0 |
-| Unsafe | BitWriter/BitReader only (unchecked buffer access) |
 | Allocations per encode/decode | 0 |
+| Heap usage | 0 (fully stack-allocated, ~330KB per Codec) |
 
 ### vs SBE total delivery time
 
-SBE encodes in ~25ns but sends uncompressed. residc compresses 3x, reducing wire time.
+SBE encodes in ~25ns (pointer cast, zero compression) but sends full-size messages. residc compresses ~3x, trading encode cycles for wire time.
 
-| Link | SBE (encode + wire) | residc (encode + wire + decode) |
-|------|--------------------|---------------------------------|
-| 1 GbE | 25ns + 152ns = **177ns** | 105ns + 51ns + 54ns = **210ns** |
-| 1 GbE (full msg) | 25ns + 480ns = **505ns** | 105ns + 160ns + 54ns = **319ns** |
-| 100 Mbps | 25ns + 4.8us = **4.8us** | 105ns + 1.6us + 54ns = **1.8us** |
+| Link | SBE (encode + wire) | residc (encode + wire + decode) | Winner |
+|------|--------------------|---------------------------------|--------|
+| 10 GbE, 19B msg | 25ns + 15ns = **40ns** | 96ns + 5ns + 55ns = **156ns** | SBE |
+| 1 GbE, 60B msg | 25ns + 480ns = **505ns** | 96ns + 160ns + 55ns = **311ns** | residc |
+| 100 Mbps WAN | 25ns + 4.8us = **4.8us** | 96ns + 1.6us + 55ns = **1.8us** | residc |
+| Multicast (N consumers) | N * 480ns wire | N * 160ns wire | residc |
 
-On bandwidth-constrained links, residc wins on total delivery time despite slower encoding.
+SBE wins in same-rack ultra-low-latency setups where bandwidth is free. residc wins everywhere bandwidth costs — WAN, cloud, data distribution, multicast, congested links.
 
 ## Usage
 
@@ -72,4 +74,4 @@ cargo bench
 cargo test
 ```
 
-14 tests cover bit I/O, MFU table, zigzag + tiered residual coding, full encode/decode roundtrip (1K messages), and compression ratio verification (10K messages).
+14 tests: bit I/O (5), MFU table (3), zigzag + tiered residual coding (3), full encode/decode roundtrip (1K messages), compression ratio (10K messages), doctest.
