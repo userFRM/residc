@@ -1,0 +1,5 @@
+*.o
+*.so
+*.a
+*.dylib
+examples/custom/quote_example
