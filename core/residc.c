@@ -38,7 +38,7 @@ void residc_bw_init(residc_bitwriter_t *bw)
     bw->byte_pos = 0;
 }
 
-static __attribute__((noinline)) void bw_flush(residc_bitwriter_t *bw)
+static void bw_flush(residc_bitwriter_t *bw)
 {
     while (bw->count >= 8) {
         bw->count -= 8;
@@ -52,6 +52,18 @@ void residc_bw_write(residc_bitwriter_t *bw, uint64_t val, int nbits)
     bw->count += nbits;
     if (__builtin_expect(bw->count >= 32, 0))
         bw_flush(bw);
+}
+
+/* Fast inline version for internal hot path */
+static inline __attribute__((always_inline))
+void bw_write(residc_bitwriter_t *bw, uint64_t val, int nbits)
+{
+    bw->accum = (bw->accum << nbits) | (val & ((1ULL << nbits) - 1));
+    bw->count += nbits;
+    while (__builtin_expect(bw->count >= 8, 0)) {
+        bw->count -= 8;
+        bw->buf[bw->byte_pos++] = (uint8_t)(bw->accum >> bw->count);
+    }
 }
 
 int residc_bw_finish(residc_bitwriter_t *bw)
@@ -78,7 +90,7 @@ void residc_br_init(residc_bitreader_t *br, const uint8_t *data, int len)
     br->byte_pos = 0;
 }
 
-static __attribute__((noinline)) void br_refill(residc_bitreader_t *br)
+static void br_refill(residc_bitreader_t *br)
 {
     while (br->count <= 56 && br->byte_pos < br->len_bytes) {
         br->accum = (br->accum << 8) | br->data[br->byte_pos++];
@@ -98,6 +110,34 @@ int residc_br_read_bit(residc_bitreader_t *br)
 {
     if (__builtin_expect(br->count < 1, 0))
         br_refill(br);
+    br->count--;
+    return (int)((br->accum >> br->count) & 1);
+}
+
+/* Fast inline versions for internal hot path */
+static inline __attribute__((always_inline))
+void br_refill_inline(residc_bitreader_t *br)
+{
+    while (br->count <= 56 && br->byte_pos < br->len_bytes) {
+        br->accum = (br->accum << 8) | br->data[br->byte_pos++];
+        br->count += 8;
+    }
+}
+
+static inline __attribute__((always_inline))
+uint64_t br_read(residc_bitreader_t *br, int nbits)
+{
+    if (__builtin_expect(br->count < nbits, 0))
+        br_refill_inline(br);
+    br->count -= nbits;
+    return (br->accum >> br->count) & ((1ULL << nbits) - 1);
+}
+
+static inline __attribute__((always_inline))
+int br_read_bit(residc_bitreader_t *br)
+{
+    if (__builtin_expect(br->count < 1, 0))
+        br_refill_inline(br);
     br->count--;
     return (int)((br->accum >> br->count) & 1);
 }
@@ -154,6 +194,50 @@ int64_t residc_decode_residual(residc_bitreader_t *br, int k)
     /* tier 4: raw 64-bit */
     uint64_t hi = residc_br_read(br, 32);
     uint64_t lo = residc_br_read(br, 32);
+    return (int64_t)((hi << 32) | lo);
+}
+
+/* Fast inline residual encode/decode for internal hot path */
+static inline __attribute__((always_inline))
+void encode_residual(residc_bitwriter_t *bw, int64_t value, int k)
+{
+    uint64_t zz = residc_zigzag_enc(value);
+    if (zz < (1ULL << k)) {
+        bw_write(bw, 0, 1);
+        bw_write(bw, zz, k);
+    } else if (zz < (1ULL << (k + 6))) {
+        bw_write(bw, 0x2, 2);
+        bw_write(bw, zz, k + 6);
+    } else if (zz < (1ULL << (k + 12))) {
+        bw_write(bw, 0x6, 3);
+        bw_write(bw, zz, k + 12);
+    } else if (zz < (1ULL << (k + 20))) {
+        bw_write(bw, 0xE, 4);
+        bw_write(bw, zz, k + 20);
+    } else {
+        bw_write(bw, 0xF, 4);
+        bw_write(bw, (uint64_t)value >> 32, 32);
+        bw_write(bw, (uint64_t)value & 0xFFFFFFFF, 32);
+    }
+}
+
+static inline __attribute__((always_inline))
+int64_t decode_residual(residc_bitreader_t *br, int k)
+{
+    if (br_read_bit(br) == 0) {
+        return residc_zigzag_dec(br_read(br, k));
+    }
+    if (br_read_bit(br) == 0) {
+        return residc_zigzag_dec(br_read(br, k + 6));
+    }
+    if (br_read_bit(br) == 0) {
+        return residc_zigzag_dec(br_read(br, k + 12));
+    }
+    if (br_read_bit(br) == 0) {
+        return residc_zigzag_dec(br_read(br, k + 20));
+    }
+    uint64_t hi = br_read(br, 32);
+    uint64_t lo = br_read(br, 32);
     return (int64_t)((hi << 32) | lo);
 }
 
@@ -347,7 +431,7 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
                                        state->ts_adapt_count,
                                        k_timestamp(state->regime),
                                        k_timestamp(state->regime) + 10);
-            residc_encode_residual(bw, residual, k);
+            encode_residual(bw, residual, k);
 
             uint64_t zz = residc_zigzag_enc(residual);
             residc_adaptive_update(&state->ts_adapt_sum,
@@ -369,17 +453,17 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
 
             if (instrument_id == state->last_instrument_id &&
                 state->msg_count > 0) {
-                residc_bw_write(bw, 0, 1);  /* same as last */
+                bw_write(bw, 0, 1);  /* same as last */
             } else {
-                residc_bw_write(bw, 1, 1);  /* different */
+                bw_write(bw, 1, 1);  /* different */
                 int mfu_idx = residc_mfu_lookup(&state->mfu, instrument_id);
                 if (mfu_idx >= 0) {
-                    residc_bw_write(bw, 0, 1);  /* in MFU */
-                    residc_bw_write(bw, (uint64_t)mfu_idx,
+                    bw_write(bw, 0, 1);  /* in MFU */
+                    bw_write(bw, (uint64_t)mfu_idx,
                                     RESIDC_MFU_INDEX_BITS);
                 } else {
-                    residc_bw_write(bw, 1, 1);  /* raw */
-                    residc_bw_write(bw, instrument_id, 14);
+                    bw_write(bw, 1, 1);  /* raw */
+                    bw_write(bw, instrument_id, 14);
                 }
             }
             /* Deferred: MFU update after commit */
@@ -397,11 +481,11 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
             /* Penny normalization */
             if (price % 100 == 0 && predicted % 100 == 0 &&
                 (price > 0 || predicted > 0)) {
-                residc_bw_write(bw, 0, 1);  /* penny mode */
-                residc_encode_residual(bw, residual / 100, k);
+                bw_write(bw, 0, 1);  /* penny mode */
+                encode_residual(bw, residual / 100, k);
             } else {
-                residc_bw_write(bw, 1, 1);  /* sub-penny mode */
-                residc_encode_residual(bw, residual, k);
+                bw_write(bw, 1, 1);  /* sub-penny mode */
+                encode_residual(bw, residual, k);
             }
 
             /* Regime tracking */
@@ -428,15 +512,15 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
             int k = k_quantity(state->regime);
 
             if (residual == 0) {
-                residc_bw_write(bw, 0, 1);  /* same as predicted */
+                bw_write(bw, 0, 1);  /* same as predicted */
             } else {
-                residc_bw_write(bw, 1, 1);  /* different */
+                bw_write(bw, 1, 1);  /* different */
                 if (qty % 100 == 0 && predicted % 100 == 0) {
-                    residc_bw_write(bw, 0, 1);  /* round lot */
-                    residc_encode_residual(bw, residual / 100, k);
+                    bw_write(bw, 0, 1);  /* round lot */
+                    encode_residual(bw, residual / 100, k);
                 } else {
-                    residc_bw_write(bw, 1, 1);  /* odd lot */
-                    residc_encode_residual(bw, residual, k);
+                    bw_write(bw, 1, 1);  /* odd lot */
+                    encode_residual(bw, residual, k);
                 }
             }
             break;
@@ -453,7 +537,7 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
             int k = residc_adaptive_k(fs->adapt_sum, fs->adapt_count,
                                        k_seqid(state->regime),
                                        k_seqid(state->regime) + 10);
-            residc_encode_residual(bw, delta, k);
+            encode_residual(bw, delta, k);
 
             uint64_t zz = residc_zigzag_enc(delta);
             residc_adaptive_update(&fs->adapt_sum, &fs->adapt_count, zz);
@@ -463,38 +547,38 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
         case RESIDC_ENUM: {
             residc_field_state_t *fs = &state->field_state[fi];
             if (val == fs->last_value && state->msg_count > 0) {
-                residc_bw_write(bw, 0, 1);  /* same */
+                bw_write(bw, 0, 1);  /* same */
             } else {
-                residc_bw_write(bw, 1, 1);  /* different */
-                residc_bw_write(bw, val, f->size * 8);
+                bw_write(bw, 1, 1);  /* different */
+                bw_write(bw, val, f->size * 8);
             }
             break;
         }
 
         case RESIDC_BOOL:
-            residc_bw_write(bw, val & 1, 1);
+            bw_write(bw, val & 1, 1);
             break;
 
         case RESIDC_CATEGORICAL: {
             residc_field_state_t *fs = &state->field_state[fi];
             if (val == fs->last_value && state->msg_count > 0) {
-                residc_bw_write(bw, 0, 1);  /* same */
+                bw_write(bw, 0, 1);  /* same */
             } else {
-                residc_bw_write(bw, 1, 1);  /* different */
-                residc_bw_write(bw, val >> 16, 16);
-                residc_bw_write(bw, val & 0xFFFF, 16);
+                bw_write(bw, 1, 1);  /* different */
+                bw_write(bw, val >> 16, 16);
+                bw_write(bw, val & 0xFFFF, 16);
             }
             break;
         }
 
         case RESIDC_RAW:
             if (f->size <= 8) {
-                residc_bw_write(bw, val, f->size * 8);
+                bw_write(bw, val, f->size * 8);
             } else {
                 /* Byte-by-byte for larger fields */
                 const uint8_t *p = (const uint8_t *)msg + f->offset;
                 for (int i = 0; i < f->size; i++)
-                    residc_bw_write(bw, p[i], 8);
+                    bw_write(bw, p[i], 8);
             }
             break;
 
@@ -505,7 +589,7 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
                 : state->field_state[fi].last_value;
             int64_t delta = (int64_t)(val - ref_val);
             int k = k_seqid(state->regime);
-            residc_encode_residual(bw, delta, k);
+            encode_residual(bw, delta, k);
             break;
         }
 
@@ -516,7 +600,7 @@ static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
                 : (is ? is->last_price : 0);
             int64_t delta = (int64_t)val - (int64_t)ref_val;
             int k = k_price(state->regime);
-            residc_encode_residual(bw, delta, k);
+            encode_residual(bw, delta, k);
             break;
         }
 
@@ -643,7 +727,7 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                                        state->ts_adapt_count,
                                        k_timestamp(state->regime),
                                        k_timestamp(state->regime) + 10);
-            int64_t residual = residc_decode_residual(br, k);
+            int64_t residual = decode_residual(br, k);
             int64_t gap = residual + predicted_gap;
             val = state->last_timestamp + (uint64_t)gap;
 
@@ -660,14 +744,14 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
         }
 
         case RESIDC_INSTRUMENT: {
-            if (residc_br_read_bit(br) == 0) {
+            if (br_read_bit(br) == 0) {
                 instrument_id = state->last_instrument_id;
             } else {
-                if (residc_br_read_bit(br) == 0) {
-                    int idx = (int)residc_br_read(br, RESIDC_MFU_INDEX_BITS);
+                if (br_read_bit(br) == 0) {
+                    int idx = (int)br_read(br, RESIDC_MFU_INDEX_BITS);
                     instrument_id = state->mfu.entries[idx].instrument_id;
                 } else {
-                    instrument_id = (uint16_t)residc_br_read(br, 14);
+                    instrument_id = (uint16_t)br_read(br, 14);
                 }
             }
             is = (instrument_id < RESIDC_MAX_INSTRUMENTS)
@@ -681,8 +765,8 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                                ? is->last_price : 0;
             int k = k_price(state->regime);
 
-            int mode = residc_br_read_bit(br);
-            int64_t residual = residc_decode_residual(br, k);
+            int mode = br_read_bit(br);
+            int64_t residual = decode_residual(br, k);
 
             uint32_t price;
             if (mode == 0) {
@@ -713,11 +797,11 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                                ? is->last_qty : 100;
             int k = k_quantity(state->regime);
 
-            if (residc_br_read_bit(br) == 0) {
+            if (br_read_bit(br) == 0) {
                 val = predicted;  /* same */
             } else {
-                int mode = residc_br_read_bit(br);
-                int64_t residual = residc_decode_residual(br, k);
+                int mode = br_read_bit(br);
+                int64_t residual = decode_residual(br, k);
                 if (mode == 0) {
                     val = (uint32_t)((int64_t)(predicted / 100) +
                                      residual) * 100;
@@ -735,7 +819,7 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
             int k = residc_adaptive_k(fs->adapt_sum, fs->adapt_count,
                                        k_seqid(state->regime),
                                        k_seqid(state->regime) + 10);
-            int64_t delta = residc_decode_residual(br, k);
+            int64_t delta = decode_residual(br, k);
             val = predicted + (uint64_t)delta;
 
             uint64_t zz = residc_zigzag_enc(delta);
@@ -745,25 +829,25 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
 
         case RESIDC_ENUM: {
             residc_field_state_t *fs = &state->field_state[fi];
-            if (residc_br_read_bit(br) == 0) {
+            if (br_read_bit(br) == 0) {
                 val = fs->last_value;
             } else {
-                val = residc_br_read(br, f->size * 8);
+                val = br_read(br, f->size * 8);
             }
             break;
         }
 
         case RESIDC_BOOL:
-            val = (uint64_t)residc_br_read_bit(br);
+            val = (uint64_t)br_read_bit(br);
             break;
 
         case RESIDC_CATEGORICAL: {
             residc_field_state_t *fs = &state->field_state[fi];
-            if (residc_br_read_bit(br) == 0) {
+            if (br_read_bit(br) == 0) {
                 val = fs->last_value;
             } else {
-                uint64_t hi = residc_br_read(br, 16);
-                uint64_t lo = residc_br_read(br, 16);
+                uint64_t hi = br_read(br, 16);
+                uint64_t lo = br_read(br, 16);
                 val = (hi << 16) | lo;
             }
             break;
@@ -771,11 +855,11 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
 
         case RESIDC_RAW:
             if (f->size <= 8) {
-                val = residc_br_read(br, f->size * 8);
+                val = br_read(br, f->size * 8);
             } else {
                 uint8_t *p = (uint8_t *)msg + f->offset;
                 for (int i = 0; i < f->size; i++)
-                    p[i] = (uint8_t)residc_br_read(br, 8);
+                    p[i] = (uint8_t)br_read(br, 8);
                 continue;  /* skip write_field */
             }
             break;
@@ -786,7 +870,7 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                              schema->fields[f->ref_field].size)
                 : state->field_state[fi].last_value;
             int k = k_seqid(state->regime);
-            int64_t delta = residc_decode_residual(br, k);
+            int64_t delta = decode_residual(br, k);
             val = ref_val + (uint64_t)delta;
             break;
         }
@@ -797,7 +881,7 @@ static int decode_fields(residc_state_t *state, const residc_schema_t *schema,
                              schema->fields[f->ref_field].size)
                 : (is ? is->last_price : 0);
             int k = k_price(state->regime);
-            int64_t delta = residc_decode_residual(br, k);
+            int64_t delta = decode_residual(br, k);
             val = (uint64_t)((int64_t)ref_val + delta);
             break;
         }

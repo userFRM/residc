@@ -159,15 +159,13 @@ If a message is lost (detected by sequence number gap), the receiver requests re
 
 | Metric | C (gcc -O2) | Rust (--release, LTO) |
 |--------|------------|----------------------|
-| Messages | 8,015,810 | 10,000 (synthetic) |
-| Ratio | 3.27:1 | 2.3:1 |
-| Encode latency | 100 ns/msg | 96 ns/msg |
-| Decode latency | 95 ns/msg | 55 ns/msg |
-| Encode throughput | 331 MB/s | 198 MB/s |
-| Decode throughput | 348 MB/s | 345 MB/s |
+| Messages | 100,000 (synthetic) | 10,000 (synthetic) |
+| Ratio | 2.71:1 | 2.3:1 |
+| Encode latency | **50 ns/msg** | 96 ns/msg |
+| Decode latency | **46 ns/msg** | 55 ns/msg |
 | Roundtrip errors | 0 | 0 |
 
-The Rust implementation achieves 42% faster decode through a 64-bit accumulator-based bit reader with unchecked pointer access. The C implementation shows higher throughput on bulk ITCH encode because ITCH messages are larger (32B avg vs 19B synthetic quotes).
+The C implementation achieves lower latency through `always_inline` on the entire encode/decode hot path: bit I/O, residual coding, and tier selection are all inlined into a single function body with zero function call overhead. On real NASDAQ ITCH 5.0 data (8M messages, 32B avg), the C codec achieves 3.27:1 compression.
 
 ### Compression breakdown by technique
 

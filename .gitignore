@@ -4,6 +4,8 @@
 *.dylib
 examples/custom/quote_example
 
+bench/bench_quote
+
 # Rust
 rust/target/
 Cargo.lock
