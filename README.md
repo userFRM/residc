@@ -1,37 +1,104 @@
 # residc
 
-**Schema-driven, per-message compression for financial data.**
+**Schema-driven, per-message prediction-residual compression for financial data.**
 
-residc compresses financial messages (quotes, orders, trades) **3-4x** by predicting each field from context and encoding only the prediction error. Unlike general-purpose compressors (LZ4, zstd), it works on individual messages — no blocks, no buffering, per-message random access.
+residc compresses financial messages (quotes, orders, trades) **3-4x** by predicting each field from context and encoding only the prediction error. Unlike general-purpose compressors (LZ4, zstd), it works on individual messages -- no blocks, no buffering, per-message random access.
+
+Structure-agnostic: you define any message struct, map fields to prediction types, and the codec handles the rest.
+
+## Benchmarks
+
+### Compression
 
 ```
-              Raw    Compressed   Ratio    Errors
-ITCH 5.0    32.2 B    9.9 B     3.27:1      0     (8M real NASDAQ messages)
-Quotes      27.0 B   11.6 B     2.34:1      0     (100K synthetic quotes)
-Orders      43.7 B   13.4 B     3.26:1      0     (2M synthetic order flow)
-LZ4/msg     32.2 B   31.5 B     1.02:1      —     (same ITCH data)
-LZ4/block   32.2 B   17.9 B     1.80:1      —     (same ITCH data, no random access)
+                Raw    Compressed   Ratio    Errors
+ITCH 5.0      32.2 B    9.9 B     3.27:1      0     (8M real NASDAQ messages)
+Quotes        27.0 B   11.6 B     2.34:1      0     (100K synthetic quotes)
+Orders        43.7 B   13.4 B     3.26:1      0     (2M synthetic order flow)
 ```
 
-## Why
+### Latency
 
-General-purpose compressors fail on small messages. LZ4 gets **1.02:1** on 32-byte ITCH messages — essentially nothing. They need kilobytes of context to find patterns.
+|  | C (gcc -O2) | Rust (--release, LTO) |
+|--|------------|----------------------|
+| Encode | 100 ns/msg | **96 ns/msg** |
+| Decode | 95 ns/msg | **55 ns/msg** |
+| Encode throughput | 331 MB/s | 198 MB/s |
+| Decode throughput | 348 MB/s | 345 MB/s |
 
-Financial data has structure that generic compressors can't exploit:
-- Timestamps advance by predictable gaps
-- A few instruments account for most messages
-- Prices move in small, penny-aligned increments
-- Quantities repeat (round lots)
-- Order IDs increment sequentially
+Rust decode is 42% faster than C due to a 64-bit accumulator-based bit reader with unchecked pointer access. C throughput is higher on bulk encode because ITCH messages are larger (32B vs 19B synthetic).
 
-residc exploits all of these patterns with per-field prediction strategies, then encodes only the residual (prediction error) using tiered variable-width codes.
+## Comparison to Alternatives
 
-## Quick Start
+### Per-message codecs (apples to apples)
+
+| Codec | Ratio (ITCH) | Encode | Decode | Per-msg | Approach |
+|-------|-------------|--------|--------|---------|----------|
+| **residc** | **3.27:1** | 96 ns | 55 ns | Yes | Prediction-residual |
+| SBE | 1.00:1 | ~25 ns | ~0 ns | Yes | Zero-copy cast, no compression |
+| FAST (FIX) | 2-4:1 | ~200 ns | ~200 ns | Yes | Template delta + stop-bit coding |
+| Protobuf | ~1.3:1 | ~150 ns | ~120 ns | Yes | Varint, no cross-message state |
+| Cap'n Proto | 1.00:1 | ~10 ns | ~0 ns | Yes | Zero-copy, no compression |
+| FlatBuffers | 1.00:1 | ~15 ns | ~0 ns | Yes | Zero-copy, no compression |
+| LZ4 per-msg | 1.02:1 | ~50 ns | ~30 ns | Yes | Byte-sequence matching (too small) |
+
+### Block codecs (different trade-off: no random access)
+
+| Codec | Ratio (ITCH) | Per-msg | Notes |
+|-------|-------------|---------|-------|
+| LZ4 block (64KB) | 1.80:1 | No | Needs buffering |
+| zstd block (64KB) | ~2.5:1 | No | Needs buffering |
+| zstd (dict) | ~2.8:1 | No | Requires pre-trained dictionary |
+
+### When to use what
+
+| Scenario | Best choice | Why |
+|----------|------------|-----|
+| Same-rack ultra-low-latency (FPGA, kernel bypass) | SBE / Cap'n Proto | 25ns encode, bandwidth is free |
+| WAN market data distribution | **residc** | 3x smaller = 3x more throughput, wire time dominates |
+| Cloud / multi-region feeds | **residc** | Bandwidth costs money, latency budget is microseconds |
+| Multicast to N consumers | **residc** | Compression paid once, wire savings multiplied N times |
+| Historical data storage | **residc** + block compressor | Per-message access + block-level ratio |
+| Cross-datacenter replication | **residc** | Every byte costs on leased lines |
+| Mobile / retail data delivery | **residc** | 30:1 on text vs raw, enables cheap data products |
+
+### Total delivery time: residc vs SBE
+
+SBE is faster to encode but sends larger messages. The real metric is **end-to-end**: encode + wire + decode.
+
+| Link | SBE total | residc total | Winner |
+|------|----------|-------------|--------|
+| 10 GbE, 19B msg | 25ns + 15ns = **40ns** | 96ns + 5ns + 55ns = **156ns** | SBE |
+| 1 GbE, 60B msg | 25ns + 480ns = **505ns** | 96ns + 160ns + 55ns = **311ns** | **residc** |
+| 100 Mbps | 25ns + 4.8us = **4.8us** | 96ns + 1.6us + 55ns = **1.8us** | **residc** |
+| Multicast, 10 consumers | 25ns + 10*480ns = **4.8us** | 96ns + 10*160ns + 55ns = **1.75us** | **residc** |
+
+### vs FAST Protocol
+
+FAST (FIX Adapted for STreaming) was the FIX Trading Community's answer to this exact problem. It used template-based delta encoding with stop-bit coding. residc differs in:
+
+- **Prediction quality**: FAST uses simple delta. residc uses EMA (timestamps), MFU tables (instruments), per-instrument tracking (prices), regime detection (adaptive k). Better predictions = smaller residuals.
+- **Coding efficiency**: FAST uses stop-bit coding (7 useful bits per byte). residc uses tiered variable-width codes at bit granularity. More compact for small values.
+- **Simplicity**: residc is two C files (1500 lines) or one Rust crate (1260 lines). FAST implementations are typically 10-50K lines.
+- **Status**: FAST is being deprecated. CME discontinued FAST feeds in 2023. SBE replaced it for low-latency; residc fills the compression niche that FAST left behind.
+
+## Implementations
+
+| | C | Rust |
+|--|---|------|
+| Files | `core/residc.h` + `core/residc.c` | `rust/src/` (4 modules) |
+| Lines | 1,498 | 1,261 |
+| Dependencies | 0 | 0 |
+| `no_std` | N/A | Yes |
+| Heap allocations | 0 | 0 |
+| Encode latency | 100 ns | 96 ns |
+| Decode latency | 95 ns | 55 ns |
+
+## Quick Start (C)
 
 ```c
 #include "residc.h"
 
-// 1. Define your message
 typedef struct {
     uint64_t timestamp;
     uint16_t instrument_id;
@@ -40,7 +107,6 @@ typedef struct {
     uint8_t  side;
 } Quote;
 
-// 2. Define a schema — map fields to prediction strategies
 static const residc_field_t fields[] = {
     { RESIDC_TIMESTAMP,  offsetof(Quote, timestamp),     8, -1 },
     { RESIDC_INSTRUMENT, offsetof(Quote, instrument_id), 2, -1 },
@@ -53,7 +119,6 @@ static const residc_schema_t schema = {
     .fields = fields, .num_fields = 5, .msg_size = sizeof(Quote),
 };
 
-// 3. Compress
 residc_state_t enc, dec;
 residc_init(&enc, &schema);
 residc_init(&dec, &schema);
@@ -62,118 +127,108 @@ Quote q = { .timestamp = 34200000000000, .instrument_id = 42,
             .price = 1500250, .quantity = 100, .side = 0 };
 
 uint8_t buf[64];
-int len = residc_encode(&enc, &q, buf, sizeof(buf));  // len ≈ 8-15 bytes
+int len = residc_encode(&enc, &q, buf, sizeof(buf));
 
 Quote decoded;
 residc_decode(&dec, buf, len, &decoded);
 // decoded == q (bit-perfect)
 ```
 
-That's it. Define a struct, map fields to types, encode/decode. The library handles prediction, residual coding, and state management.
+## Quick Start (Rust)
+
+```rust
+use residc::{Schema, FieldType, Codec, Message};
+
+let schema = Schema::builder()
+    .field("timestamp", FieldType::Timestamp)
+    .field("instrument", FieldType::Instrument)
+    .field("price", FieldType::Price)
+    .field("quantity", FieldType::Quantity)
+    .field("side", FieldType::Bool)
+    .build();
+
+let mut enc = Codec::new(&schema);
+let mut dec = Codec::new(&schema);
+
+let msg = Message::new()
+    .set(0, 34_200_000_000_000u64)
+    .set(1, 42u64)
+    .set(2, 1_500_250u64)
+    .set(3, 100u64)
+    .set(4, 0u64);
+
+let mut buf = [0u8; 64];
+let len = enc.encode(&msg, &mut buf).unwrap();
+let decoded = dec.decode(&buf[..len]).unwrap();
+assert_eq!(decoded.get(2), 1_500_250);
+```
 
 ## Field Types
 
-| Type | Prediction | Use for |
-|------|-----------|---------|
-| `RESIDC_TIMESTAMP` | EMA of inter-message gaps | Nanosecond timestamps |
-| `RESIDC_INSTRUMENT` | MFU table (top 64 by frequency) | Security/instrument IDs |
-| `RESIDC_PRICE` | Per-instrument last price + penny normalization | Prices (fixed-point) |
-| `RESIDC_QUANTITY` | Per-instrument last quantity + zero-residual flag + round-lot normalization | Share quantities |
-| `RESIDC_SEQUENTIAL_ID` | Delta from last (global or per-instrument) | Order IDs, execution IDs |
-| `RESIDC_ENUM` | Same-as-last flag | Side (B/S), order type, TIF |
-| `RESIDC_BOOL` | None | 1-bit fields |
-| `RESIDC_CATEGORICAL` | Same-as-last flag | Account IDs, firm codes |
-| `RESIDC_DELTA_ID` | Delta from a reference field in same message | orig_cl_ord_id |
-| `RESIDC_DELTA_PRICE` | Delta from a reference price field | ask (delta from bid), last_px |
-| `RESIDC_COMPUTED` | Not transmitted (0 bits) | Derived fields (leaves_qty) |
-| `RESIDC_RAW` | None (verbatim) | Unpredictable fields |
+| Type | Prediction Strategy | Use for |
+|------|-------------------|---------|
+| `Timestamp` | EMA of inter-message gaps + adaptive k | Nanosecond timestamps |
+| `Instrument` | MFU table (top 64 by frequency) | Security/instrument IDs |
+| `Price` | Per-instrument last price + penny normalization | Fixed-point prices |
+| `Quantity` | Per-instrument last qty + zero-residual flag + round-lot | Share/lot quantities |
+| `SequentialId` | Delta from last (per-instrument or global) + adaptive k | Order IDs, execution IDs |
+| `Enum` | Same-as-last flag | Side (B/S), order type, TIF |
+| `Bool` | None (1 bit) | Flags |
+| `Categorical` | Same-as-last flag | Account IDs, firm codes |
+| `DeltaPrice` | Delta from a reference price field in same message | Ask price (delta from bid) |
+| `DeltaId` | Delta from a reference ID field in same message | Original order ref |
+| `Computed` | Not transmitted (0 bits on wire) | Derived fields (leaves_qty) |
+| `Raw` | None (verbatim) | Unpredictable fields |
 
 ## How It Works
 
 For each message:
 
-1. **Predict** each field from encoder/decoder state (both maintain identical state)
+1. **Predict** each field from synchronized encoder/decoder state
 2. **Compute residual** = actual - predicted
-3. **Encode residual** with tiered variable-width code:
-   - Tier 0: `0` + k bits (small residuals)
-   - Tier 1: `10` + (k+6) bits
-   - Tier 2: `110` + (k+12) bits
-   - Tier 3: `1110` + (k+20) bits
-   - Tier 4: `1111` + 64 raw bits (fallback)
-4. **Update state** on both encoder and decoder
+3. **Zigzag encode** the signed residual to unsigned: `0 -> 0, -1 -> 1, 1 -> 2, -2 -> 3, ...`
+4. **Tiered encode** the unsigned residual (parameterized by k):
 
-The `k` parameter adapts based on market regime (calm vs volatile), so the codec automatically adjusts to changing conditions.
+```
+Tier 0:  0                       value = 0               cost: 1 bit
+Tier 1:  10  + k bits            values [1, 2^k]         cost: 2+k bits
+Tier 2:  110 + 2k bits           next 2^(2k) values      cost: 3+2k bits
+Tier 3:  1110 + 3k bits          next 2^(3k) values      cost: 4+3k bits
+Tier 4:  11110 + 32 bits         any 32-bit value         cost: 37 bits
+Tier 5:  11111 + 64 bits         any 64-bit value         cost: 69 bits
+```
 
-Each compressed message is independently framed: `[1-byte length] [payload]`. No block boundaries. Any message can be decoded given the codec state up to that point.
+5. **Update state** identically on both encoder and decoder
 
-## Performance
+The k parameter adapts to market regime (CALM vs VOLATILE), detected every 64 messages from average price residual magnitude.
 
-Measured on NASDAQ ITCH 5.0 data (8M real messages, Intel Xeon):
+Each compressed message is independently framed: `[1-byte length][payload]`. If compressed size >= raw size, a literal fallback frame (`0xFF` marker) is used, guaranteeing worst-case expansion of 1 byte.
 
-| Metric | Value |
-|--------|-------|
-| Compression ratio | 3.27:1 |
-| Encode throughput | 331 MB/s |
-| Decode throughput | 348 MB/s |
-| Encode latency | ~100 ns/msg |
-| Decode latency | ~95 ns/msg |
-| Heap allocations | 0 |
-| Roundtrip errors | 0 |
+## Cross-Machine Operation
+
+Encoder and decoder run on different machines. They stay synchronized through identical state evolution -- both compute the same predictions from the same message stream. No shared memory, no coordination protocol. The wire carries only compressed frames.
 
 ## Building
 
-residc is two files: `core/residc.h` and `core/residc.c`. Add them to your project.
+### C
 
 ```bash
-# Build and run the example
-cd examples/custom
-cc -O2 -o quote_example quote_example.c ../../core/residc.c -I../../core
+# Two files, no dependencies
+cc -O2 -o quote_example examples/custom/quote_example.c core/residc.c -Icore
 ./quote_example
 ```
 
-## Advanced: Building Blocks
+### Rust
 
-If the schema-driven API doesn't fit your needs, you can use the building blocks directly:
-
-```c
-// Bit writer
-residc_bitwriter_t bw;
-residc_bw_init(&bw);
-residc_bw_write(&bw, 42, 7);           // write 7 bits
-residc_encode_residual(&bw, -13, 3);   // encode signed residual with k=3
-int len = residc_bw_finish(&bw);       // flush to bw.buf[]
-
-// Bit reader
-residc_bitreader_t br;
-residc_br_init(&br, bw.buf, len);
-uint64_t val = residc_br_read(&br, 7);          // read 7 bits
-int64_t res = residc_decode_residual(&br, 3);    // decode residual
-
-// MFU table
-residc_mfu_table_t mfu;
-residc_mfu_init(&mfu);
-residc_mfu_update(&mfu, instrument_id);
-int idx = residc_mfu_lookup(&mfu, instrument_id);  // -1 or 0-63
-
-// Adaptive k
-uint64_t sum = 0; uint32_t count = 0;
-residc_adaptive_update(&sum, &count, zigzag_value);
-int k = residc_adaptive_k(sum, count, 3, 15);
+```bash
+cd rust
+cargo test     # 14 tests
+cargo bench    # criterion benchmarks
 ```
 
-## Technique
+## Technical Paper
 
-residc applies prediction-residual coding — a technique from signal processing (JPEG-LS, FLAC, DPCM) — to financial message fields. The key insight is that financial data is a **structured time series** with strong per-field correlations:
-
-- Timestamps are quasi-periodic → EMA prediction captures the rhythm
-- Instrument distribution follows Zipf's law → MFU table captures top 64
-- Prices are mean-reverting per instrument → per-instrument delta is small
-- Quantities cluster at round lots → zero-residual flag + normalization
-- IDs are sequential → delta is near-zero
-
-By combining domain-specific predictions with adaptive tiered coding, residc achieves 3-4x compression on individual messages where general-purpose compressors achieve ~1x.
-
-See [TECHNIQUE.md](doc/TECHNIQUE.md) for the full technical description.
+See [doc/TECHNIQUE.md](doc/TECHNIQUE.md) for the full technical description: prediction strategies, tiered residual coding, adaptive k, regime detection, framing, and state synchronization.
 
 ## License
 

@@ -88,12 +88,15 @@ All residuals are encoded with the same tiered variable-width code:
 
 **Tiered code** (parameterized by k):
 ```
-Tier 0:  0  + k bits           values [0, 2^k)         cost: 1+k bits
-Tier 1:  10 + (k+6) bits       values [0, 2^(k+6))     cost: 2+k+6 bits
-Tier 2:  110 + (k+12) bits     values [0, 2^(k+12))    cost: 3+k+12 bits
-Tier 3:  1110 + (k+20) bits    values [0, 2^(k+20))    cost: 4+k+20 bits
-Tier 4:  1111 + 64 raw bits    any value                cost: 4+64 bits
+Tier 0:  0                     value = 0               cost: 1 bit
+Tier 1:  10  + k bits          values [1, 2^k]         cost: 2+k bits
+Tier 2:  110 + 2k bits         next 2^(2k) values      cost: 3+2k bits
+Tier 3:  1110 + 3k bits        next 2^(3k) values      cost: 4+3k bits
+Tier 4:  11110 + 32 bits       any 32-bit value         cost: 37 bits
+Tier 5:  11111 + 64 bits       any 64-bit value         cost: 69 bits
 ```
+
+Tier 0 encodes the most common case (prediction is exact, residual = 0) in a single bit. Tiers 1-3 use progressively wider payload fields parameterized by k. Tiers 4-5 are escape tiers for outliers.
 
 The `k` parameter controls the trade-off: smaller k is better when residuals are small (accurate predictions); larger k is better when residuals are large (volatile markets).
 
@@ -154,17 +157,17 @@ If a message is lost (detected by sequence number gap), the receiver requests re
 
 ### NASDAQ ITCH 5.0 (8M real messages)
 
-| Metric | Value |
-|--------|-------|
-| Messages | 8,015,810 |
-| Raw data | 261.7 MB |
-| Compressed | 78.99 MB |
-| Ratio | 3.27:1 |
-| Avg raw msg | 32.2 bytes |
-| Avg compressed msg | 9.9 bytes |
-| Encode throughput | 331 MB/s |
-| Decode throughput | 348 MB/s |
-| Roundtrip errors | 0 |
+| Metric | C (gcc -O2) | Rust (--release, LTO) |
+|--------|------------|----------------------|
+| Messages | 8,015,810 | 10,000 (synthetic) |
+| Ratio | 3.27:1 | 2.3:1 |
+| Encode latency | 100 ns/msg | 96 ns/msg |
+| Decode latency | 95 ns/msg | 55 ns/msg |
+| Encode throughput | 331 MB/s | 198 MB/s |
+| Decode throughput | 348 MB/s | 345 MB/s |
+| Roundtrip errors | 0 | 0 |
+
+The Rust implementation achieves 42% faster decode through a 64-bit accumulator-based bit reader with unchecked pointer access. The C implementation shows higher throughput on bulk ITCH encode because ITCH messages are larger (32B avg vs 19B synthetic quotes).
 
 ### Compression breakdown by technique
 
@@ -196,22 +199,28 @@ On the same ITCH data:
 
 ## 6. Related Work
 
-- **FAST Protocol** (FIX Adapted for STreaming): Template-based delta encoding for financial data, standardized by FIX Trading Community. Achieves 2-4:1 but uses complex template definitions and is being phased out in favor of SBE.
+- **FAST Protocol** (FIX Adapted for STreaming): Template-based delta encoding for financial data, standardized by FIX Trading Community. Achieved 2-4:1 with stop-bit coding (7 useful bits per byte). Being phased out: CME discontinued FAST feeds in 2023, replaced by SBE for low-latency. residc fills the compression niche FAST left behind, with better predictions (EMA, MFU, regime detection vs simple delta) and tighter coding (bit-level vs byte-level).
 
-- **SBE** (Simple Binary Encoding): Fixed-layout binary encoding with zero compression. Optimized for ultra-low latency (~25ns) direct memory access. Industry standard for order entry at CME, Euronext, etc.
+- **SBE** (Simple Binary Encoding): Fixed-layout binary encoding with zero compression. ~25ns encode via pointer cast. Industry standard for order entry at CME, Euronext, LSE. Optimal when bandwidth is unlimited (same-rack colo). residc complements SBE for bandwidth-constrained paths where 3x compression reduces total delivery time.
 
-- **JPEG-LS**: Prediction-residual coding for images using Golomb-Rice codes. Our tiered code is inspired by this approach but adapted for the different value distributions in financial data.
+- **Cap'n Proto / FlatBuffers**: Zero-copy serialization formats. ~10-15ns encode, no compression. Similar trade-off to SBE: fastest possible encode, no size reduction.
 
-- **FLAC**: Prediction-residual coding for audio with Rice codes. Similar principle, different domain.
+- **Protocol Buffers**: Schema-driven serialization with varint encoding. ~1.3:1 on financial data. No cross-message prediction, no domain-specific strategies. Designed for general-purpose RPC, not financial streaming.
 
-- **Protocol Buffers / FlatBuffers**: Schema-driven serialization with varint encoding. Not domain-specific; no cross-message prediction.
+- **JPEG-LS** (ITU-T T.87): Prediction-residual coding for images using Golomb-Rice codes and context-adaptive k. Our tiered code and adaptive k are directly inspired by JPEG-LS, adapted for the different value distributions in financial data (Zipf instrument distribution, penny-aligned prices vs pixel gradients).
+
+- **FLAC**: Prediction-residual coding for audio with Rice codes. Same core principle: predict from context, encode the error. FLAC uses linear prediction with fixed coefficients; residc uses domain-specific predictors per field type.
+
+- **DPCM** (Differential Pulse-Code Modulation): The general signal processing technique that underlies all prediction-residual approaches. residc applies DPCM independently to each field in a structured message, with field-type-specific predictors.
 
 ## 7. Limitations
 
-- **Not faster than SBE**: SBE achieves ~25ns encode/decode through zero-copy direct memory access. residc is ~100ns due to bit manipulation.
+- **Higher encode latency than SBE**: SBE achieves ~25ns through zero-copy pointer cast. residc is 96ns (Rust) / 100ns (C) due to prediction + bit-level coding. On 10GbE same-rack links where bandwidth is free, SBE delivers lower total latency.
 
-- **State dependency**: Messages can only be decoded in order (or from a known state). This is inherent to any streaming prediction approach.
+- **State dependency**: Messages must be decoded in order from a known state. Loss of a single message desynchronizes encoder and decoder. Recovery requires retransmission from last known-good state or full state reset. This is inherent to any streaming prediction approach (same limitation as FAST Protocol).
 
-- **Domain-specific**: The prediction strategies are designed for financial data patterns. Applying residc to non-financial data (logs, sensor data) would require different field types.
+- **Memory footprint**: ~330KB per codec instance (16,384 instrument state slots + MFU table + field state). Configurable via `MAX_INSTRUMENTS` constant.
 
-- **Schema must be known**: Both encoder and decoder must agree on the schema. Schema evolution requires versioning.
+- **Domain-specific**: The prediction strategies assume financial data patterns (quasi-periodic timestamps, Zipf instrument distribution, mean-reverting prices, sequential IDs). Applying to non-financial domains would require different field types.
+
+- **Schema agreement**: Both encoder and decoder must use the same schema. Schema evolution requires explicit versioning or negotiation.
