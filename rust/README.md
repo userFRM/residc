@@ -34,7 +34,7 @@ Measured on 5-field synthetic quotes, `--release` with LTO + `target-cpu=native`
 | Encode | ~122 ns/msg |
 | Decode | ~91 ns/msg |
 
-FFI overhead (~40-70ns) accounts for the difference vs the raw C benchmark (51ns/39ns). For latency-critical paths, use the C API directly.
+The Rust SDK wraps the C core via FFI. FFI call overhead (~40-70ns) accounts for the difference vs the raw C benchmark (~51ns encode / ~48ns decode). The underlying C codec wire format is identical. For latency-critical paths, use the C API directly or the SDK shared library.
 
 ## Building
 

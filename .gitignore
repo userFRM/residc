@@ -5,6 +5,22 @@
 examples/custom/quote_example
 
 bench/bench_quote
+bench/bench_compression
+
+# Test binaries
+test/test_bitio
+test/test_zigzag
+test/test_tiered
+test/test_mfu
+test/test_adaptive
+test/test_roundtrip
+test/test_edge
+test/test_errors
+
+# Fuzz
+fuzz/fuzz_decode
+fuzz/fuzz_roundtrip
+fuzz/corpus/
 
 # Rust
 rust/target/

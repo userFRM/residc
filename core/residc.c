@@ -10,6 +10,8 @@
 #include "residc.h"
 
 _Static_assert((-1 >> 1) == -1, "residc requires arithmetic right shift");
+_Static_assert(RESIDC_SCRATCH_BYTES >= 280,
+    "RESIDC_SCRATCH_BYTES must accommodate worst-case encoding plus 8-byte memcpy padding");
 
 /* ================================================================
  * Internal: k parameter tables
@@ -58,11 +60,14 @@ void residc_bw_write(residc_bitwriter_t *bw, uint64_t val, int nbits)
 /* Fast inline version for internal hot path — word-at-a-time flush.
  * When count >= 32, flush all complete bytes via a single 8-byte store
  * instead of looping byte-by-byte. Wire format is identical.
- * Threshold is 32 because the largest single write is 32 bits,
- * so count + nbits <= 32 + 32 = 64 (no accumulator overflow). */
+ * Threshold is 32; largest single write is 34 bits (tier 3 with k=20).
+ * After flush count is 0-7, so max accumulation is 7+34=41 < 64. */
 static inline __attribute__((always_inline))
 void bw_write(residc_bitwriter_t *bw, uint64_t val, int nbits)
 {
+#ifndef NDEBUG
+    if (nbits > 56 || nbits < 0) __builtin_trap();
+#endif
     bw->accum = (bw->accum << nbits) | (val & ((1ULL << nbits) - 1));
     bw->count += nbits;
     if (__builtin_expect(bw->count >= 32, 0)) {
@@ -99,6 +104,7 @@ void residc_br_init(residc_bitreader_t *br, const uint8_t *data, int len)
     br->accum = 0;
     br->count = 0;
     br->byte_pos = 0;
+    br->error = 0;
 }
 
 static void br_refill(residc_bitreader_t *br)
@@ -111,16 +117,26 @@ static void br_refill(residc_bitreader_t *br)
 
 uint64_t residc_br_read(residc_bitreader_t *br, int nbits)
 {
-    if (__builtin_expect(br->count < nbits, 0))
+    if (__builtin_expect(br->count < nbits, 0)) {
         br_refill(br);
+        if (__builtin_expect(br->count < nbits, 0)) {
+            br->error = 1;
+            return 0;
+        }
+    }
     br->count -= nbits;
     return (br->accum >> br->count) & ((1ULL << nbits) - 1);
 }
 
 int residc_br_read_bit(residc_bitreader_t *br)
 {
-    if (__builtin_expect(br->count < 1, 0))
+    if (__builtin_expect(br->count < 1, 0)) {
         br_refill(br);
+        if (__builtin_expect(br->count < 1, 0)) {
+            br->error = 1;
+            return 0;
+        }
+    }
     br->count--;
     return (int)((br->accum >> br->count) & 1);
 }
@@ -162,8 +178,13 @@ void br_refill_inline(residc_bitreader_t *br)
 static inline __attribute__((always_inline))
 uint64_t br_read(residc_bitreader_t *br, int nbits)
 {
-    if (__builtin_expect(br->count < nbits, 0))
+    if (__builtin_expect(br->count < nbits, 0)) {
         br_refill_inline(br);
+        if (__builtin_expect(br->count < nbits, 0)) {
+            br->error = 1;
+            return 0;
+        }
+    }
     br->count -= nbits;
     return (br->accum >> br->count) & ((1ULL << nbits) - 1);
 }
@@ -171,8 +192,13 @@ uint64_t br_read(residc_bitreader_t *br, int nbits)
 static inline __attribute__((always_inline))
 int br_read_bit(residc_bitreader_t *br)
 {
-    if (__builtin_expect(br->count < 1, 0))
+    if (__builtin_expect(br->count < 1, 0)) {
         br_refill_inline(br);
+        if (__builtin_expect(br->count < 1, 0)) {
+            br->error = 1;
+            return 0;
+        }
+    }
     br->count--;
     return (int)((br->accum >> br->count) & 1);
 }
@@ -180,30 +206,6 @@ int br_read_bit(residc_bitreader_t *br)
 /* ================================================================
  * Zigzag + Tiered Residual Coding
  * ================================================================ */
-
-void residc_encode_residual(residc_bitwriter_t *bw, int64_t value, int k)
-{
-    uint64_t zz = residc_zigzag_enc(value);
-
-    if (zz < (1ULL << k)) {
-        /* tier 0: 0-prefix implicit (zz < 2^k), single write of 1+k bits */
-        residc_bw_write(bw, zz, 1 + k);
-    } else if (zz < (1ULL << (k + 2))) {
-        /* tier 1: prefix 10 + k+2 payload bits, fused into one write */
-        residc_bw_write(bw, (0x2ULL << (k + 2)) | zz, 2 + k + 2);
-    } else if (zz < (1ULL << (k + 5))) {
-        /* tier 2: prefix 110 + k+5 payload bits */
-        residc_bw_write(bw, (0x6ULL << (k + 5)) | zz, 3 + k + 5);
-    } else if (zz < (1ULL << (k + 10))) {
-        /* tier 3: prefix 1110 + k+10 payload bits */
-        residc_bw_write(bw, (0xEULL << (k + 10)) | zz, 4 + k + 10);
-    } else {
-        /* tier 4: prefix 1111 + 64 raw bits */
-        residc_bw_write(bw, 0xF, 4);
-        residc_bw_write(bw, (uint64_t)value >> 32, 32);
-        residc_bw_write(bw, (uint64_t)value & 0xFFFFFFFF, 32);
-    }
-}
 
 /* Decode tier LUT: peek 4 bits -> {tier, prefix_bits_consumed}
  * 0xxx=tier0(1bit), 10xx=tier1(2bit), 110x=tier2(3bit),
@@ -217,26 +219,8 @@ static const struct { uint8_t tier; uint8_t prefix_bits; } decode_tier_lut[16] =
 };
 static const int8_t decode_payload_add[] = {0, 2, 5, 10, 0};
 
-int64_t residc_decode_residual(residc_bitreader_t *br, int k)
-{
-    /* 4-bit peek LUT: determine tier without sequential bit reads */
-    if (__builtin_expect(br->count < 4, 0))
-        br_refill(br);
-    int peek = (int)((br->accum >> (br->count - 4)) & 0xF);
-    int tier = decode_tier_lut[peek].tier;
-    br->count -= decode_tier_lut[peek].prefix_bits;
-
-    if (__builtin_expect(tier < 4, 1)) {
-        uint64_t zz = residc_br_read(br, k + decode_payload_add[tier]);
-        return residc_zigzag_dec(zz);
-    }
-    /* tier 4: raw 64-bit */
-    uint64_t hi = residc_br_read(br, 32);
-    uint64_t lo = residc_br_read(br, 32);
-    return (int64_t)((hi << 32) | lo);
-}
-
-/* Fast inline residual encode/decode for internal hot path */
+/* Inline residual encode/decode — canonical implementation used by both
+ * the internal hot path and the public API wrappers below. */
 static inline __attribute__((always_inline))
 void encode_residual(residc_bitwriter_t *bw, int64_t value, int k)
 {
@@ -259,7 +243,6 @@ void encode_residual(residc_bitwriter_t *bw, int64_t value, int k)
 static inline __attribute__((always_inline))
 int64_t decode_residual(residc_bitreader_t *br, int k)
 {
-    /* Ensure at least 4 bits available for peek */
     if (__builtin_expect(br->count < 4, 0))
         br_refill_inline(br);
     int peek = (int)((br->accum >> (br->count - 4)) & 0xF);
@@ -274,74 +257,18 @@ int64_t decode_residual(residc_bitreader_t *br, int k)
     return (int64_t)((hi << 32) | lo);
 }
 
+/* Public API wrappers — delegate to inline implementations */
+void residc_encode_residual(residc_bitwriter_t *bw, int64_t value, int k)
+{ encode_residual(bw, value, k); }
+
+int64_t residc_decode_residual(residc_bitreader_t *br, int k)
+{ return decode_residual(br, k); }
+
 /* ================================================================
  * Exp-Golomb Residual Coding
  * ================================================================ */
 
-void residc_encode_residual_expg(residc_bitwriter_t *bw, int64_t value, int k)
-{
-    uint64_t zz = residc_zigzag_enc(value);
-    if (__builtin_expect(zz > UINT64_MAX - (1ULL << k), 0)) {
-        residc_bw_write(bw, 0xFFFFFFFF, 32);
-        residc_bw_write(bw, (uint64_t)value >> 32, 32);
-        residc_bw_write(bw, (uint64_t)value & 0xFFFFFFFF, 32);
-        return;
-    }
-    uint64_t m = zz + (1ULL << k);
-    int bits = 64 - __builtin_clzll(m);
-    int q = bits - 1 - k;
-
-    if (__builtin_expect(q > 31, 0)) {
-        residc_bw_write(bw, 0xFFFFFFFF, 32);
-        residc_bw_write(bw, (uint64_t)value >> 32, 32);
-        residc_bw_write(bw, (uint64_t)value & 0xFFFFFFFF, 32);
-        return;
-    }
-
-    if (q > 0)
-        residc_bw_write(bw, (1ULL << q) - 1, q);
-    residc_bw_write(bw, 0, 1);
-    int rem_bits = q + k;
-    if (rem_bits > 32) {
-        int hi_bits = rem_bits - 32;
-        uint64_t rem_val = m & ((1ULL << rem_bits) - 1);
-        residc_bw_write(bw, rem_val >> 32, hi_bits);
-        residc_bw_write(bw, rem_val & 0xFFFFFFFF, 32);
-    } else if (rem_bits > 0) {
-        residc_bw_write(bw, m & ((1ULL << rem_bits) - 1), rem_bits);
-    }
-}
-
-int64_t residc_decode_residual_expg(residc_bitreader_t *br, int k)
-{
-    int q = 0;
-    while (q < 32 && residc_br_read_bit(br) == 1)
-        q++;
-
-    if (__builtin_expect(q >= 32, 0)) {
-        uint64_t hi = residc_br_read(br, 32);
-        uint64_t lo = residc_br_read(br, 32);
-        return (int64_t)((hi << 32) | lo);
-    }
-
-    int rem_bits = q + k;
-    uint64_t rem;
-    if (rem_bits > 32) {
-        int hi_bits = rem_bits - 32;
-        uint64_t hi = residc_br_read(br, hi_bits);
-        uint64_t lo = residc_br_read(br, 32);
-        rem = (hi << 32) | lo;
-    } else if (rem_bits > 0) {
-        rem = residc_br_read(br, rem_bits);
-    } else {
-        rem = 0;
-    }
-    uint64_t m = ((uint64_t)1 << (q + k)) | rem;
-    uint64_t zz = m - (1ULL << k);
-    return residc_zigzag_dec(zz);
-}
-
-/* Fast inline Exp-Golomb for internal hot path */
+/* Inline Exp-Golomb — canonical implementation */
 static inline __attribute__((always_inline))
 void encode_residual_expg(residc_bitwriter_t *bw, int64_t value, int k)
 {
@@ -406,6 +333,13 @@ int64_t decode_residual_expg(residc_bitreader_t *br, int k)
     uint64_t zz = m - (1ULL << k);
     return residc_zigzag_dec(zz);
 }
+
+/* Public API wrappers */
+void residc_encode_residual_expg(residc_bitwriter_t *bw, int64_t value, int k)
+{ encode_residual_expg(bw, value, k); }
+
+int64_t residc_decode_residual_expg(residc_bitreader_t *br, int k)
+{ return decode_residual_expg(br, k); }
 
 void residc_set_coder(residc_state_t *state, int coder)
 {
@@ -711,7 +645,12 @@ int decode_mfu_rank(residc_bitreader_t *br)
         return 4 + (int)br_read(br, 4);           /* rank 4-15 */
     if (br_read_bit(br) == 0)
         return 16 + (int)br_read(br, 6);          /* rank 16-63 */
-    return 64 + (int)br_read(br, 8);              /* rank 64-255 */
+    {
+        int rank = 64 + (int)br_read(br, 8);
+        if (__builtin_expect(rank >= RESIDC_MFU_SIZE, 0))
+            rank = RESIDC_MFU_SIZE - 1;
+        return rank;                                  /* rank 64-255 */
+    }
 }
 
 static int encode_fields(residc_state_t *state, const residc_schema_t *schema,
@@ -1091,7 +1030,8 @@ int residc_encode(residc_state_t *state, const void *msg,
                   uint8_t *out, int capacity)
 {
     const residc_schema_t *schema = state->schema;
-    if (!schema || capacity < 2) return -1;
+    if (!schema) return RESIDC_ERR_NULL;
+    if (capacity < 2) return RESIDC_ERR_CAPACITY;
 
     residc_bitwriter_t bw;
     residc_bw_init(&bw);
@@ -1104,7 +1044,7 @@ int residc_encode(residc_state_t *state, const void *msg,
     int raw_size = residc_raw_size(schema);
     if (payload_len >= raw_size || payload_len >= 254) {
         /* Literal fallback */
-        if (capacity < 1 + raw_size) return -1;
+        if (capacity < 1 + raw_size) return RESIDC_ERR_CAPACITY;
         out[0] = RESIDC_FRAME_LITERAL;
         /* Serialize raw fields */
         int pos = 1;
@@ -1120,7 +1060,7 @@ int residc_encode(residc_state_t *state, const void *msg,
     }
 
     /* Compressed frame */
-    if (capacity < 1 + payload_len) return -1;
+    if (capacity < 1 + payload_len) return RESIDC_ERR_CAPACITY;
     out[0] = (uint8_t)payload_len;
     memcpy(out + 1, bw.buf, payload_len);
 
@@ -1378,7 +1318,8 @@ int residc_decode(residc_state_t *state, const uint8_t *in, int in_len,
                   void *msg)
 {
     const residc_schema_t *schema = state->schema;
-    if (!schema || in_len < 1) return -1;
+    if (!schema) return RESIDC_ERR_NULL;
+    if (in_len < 1) return RESIDC_ERR_TRUNCATED;
 
     memset(msg, 0, schema->msg_size);
 
@@ -1392,7 +1333,7 @@ int residc_decode(residc_state_t *state, const uint8_t *in, int in_len,
             if (f->type == RESIDC_COMPUTED) continue;
             uint64_t val = 0;
             for (int b = f->size - 1; b >= 0; b--) {
-                if (pos >= in_len) return -1;
+                if (pos >= in_len) return RESIDC_ERR_TRUNCATED;
                 val |= (uint64_t)in[pos++] << (b * 8);
             }
             write_field(msg, f->offset, f->size, val);
@@ -1403,13 +1344,13 @@ int residc_decode(residc_state_t *state, const uint8_t *in, int in_len,
 
     /* Compressed */
     int payload_len = (int)frame;
-    if (1 + payload_len > in_len) return -1;
+    if (1 + payload_len > in_len) return RESIDC_ERR_TRUNCATED;
 
     residc_bitreader_t br;
     residc_br_init(&br, in + 1, payload_len);
 
     decode_fields(state, schema, &br, msg);
-    /* state already updated by decode_fields */
+    if (__builtin_expect(br.error, 0)) return RESIDC_ERR_TRUNCATED;
 
     return 1 + payload_len;
 }
@@ -1448,12 +1389,13 @@ int residc_encode_multi(residc_state_t *state, const void *msg,
                         uint8_t *out, int capacity)
 {
     const residc_multi_schema_t *multi = state->multi_schema;
-    if (!multi || capacity < 2) return -1;
+    if (!multi) return RESIDC_ERR_NULL;
+    if (capacity < 2) return RESIDC_ERR_CAPACITY;
 
     uint8_t type_val = *(const uint8_t *)((const uint8_t *)msg +
                                            multi->type_offset);
     int type_idx = multi->type_to_index(type_val);
-    if (type_idx < 0 || type_idx >= multi->num_types) return -1;
+    if (type_idx < 0 || type_idx >= multi->num_types) return RESIDC_ERR_SCHEMA;
 
     const residc_schema_t *schema = &multi->schemas[type_idx];
 
@@ -1476,7 +1418,7 @@ int residc_encode_multi(residc_state_t *state, const void *msg,
 
     if (payload_len >= raw_size || payload_len >= 254) {
         /* Literal fallback */
-        if (capacity < 1 + raw_size) return -1;
+        if (capacity < 1 + raw_size) return RESIDC_ERR_CAPACITY;
         out[0] = RESIDC_FRAME_LITERAL;
         out[1] = type_val;
         int pos = 2;
@@ -1504,15 +1446,16 @@ int residc_decode_multi(residc_state_t *state, const uint8_t *in, int in_len,
                         void *msg)
 {
     const residc_multi_schema_t *multi = state->multi_schema;
-    if (!multi || in_len < 1) return -1;
+    if (!multi) return RESIDC_ERR_NULL;
+    if (in_len < 1) return RESIDC_ERR_TRUNCATED;
 
     uint8_t frame = in[0];
 
     if (frame == RESIDC_FRAME_LITERAL) {
-        if (in_len < 2) return -1;
+        if (in_len < 2) return RESIDC_ERR_TRUNCATED;
         uint8_t type_val = in[1];
         int type_idx = multi->type_to_index(type_val);
-        if (type_idx < 0) return -1;
+        if (type_idx < 0) return RESIDC_ERR_CORRUPT;
         const residc_schema_t *schema = &multi->schemas[type_idx];
 
         memset(msg, 0, schema->msg_size);
@@ -1524,7 +1467,7 @@ int residc_decode_multi(residc_state_t *state, const uint8_t *in, int in_len,
             if (f->type == RESIDC_COMPUTED) continue;
             uint64_t val = 0;
             for (int b = f->size - 1; b >= 0; b--) {
-                if (pos >= in_len) return -1;
+                if (pos >= in_len) return RESIDC_ERR_TRUNCATED;
                 val |= (uint64_t)in[pos++] << (b * 8);
             }
             write_field(msg, f->offset, f->size, val);
@@ -1535,7 +1478,7 @@ int residc_decode_multi(residc_state_t *state, const uint8_t *in, int in_len,
     }
 
     int payload_len = (int)frame;
-    if (1 + payload_len > in_len) return -1;
+    if (1 + payload_len > in_len) return RESIDC_ERR_TRUNCATED;
 
     residc_bitreader_t br;
     residc_br_init(&br, in + 1, payload_len);
@@ -1555,8 +1498,40 @@ int residc_decode_multi(residc_state_t *state, const uint8_t *in, int in_len,
     *(uint8_t *)((uint8_t *)msg + multi->type_offset) = type_val;
 
     decode_fields(state, schema, &br, msg);
-    /* state already updated by decode_fields */
+    if (__builtin_expect(br.error, 0)) return RESIDC_ERR_TRUNCATED;
     state->last_msg_type_index = (uint8_t)type_idx;
 
     return 1 + payload_len;
+}
+
+/* ================================================================
+ * Error Strings and Version Header
+ * ================================================================ */
+
+const char *residc_strerror(int err)
+{
+    switch (err) {
+    case RESIDC_OK:            return "success";
+    case RESIDC_ERR_NULL:      return "null state or schema pointer";
+    case RESIDC_ERR_CAPACITY:  return "output buffer too small";
+    case RESIDC_ERR_TRUNCATED: return "input stream truncated";
+    case RESIDC_ERR_CORRUPT:   return "corrupt compressed data";
+    case RESIDC_ERR_OVERFLOW:  return "internal buffer overflow";
+    case RESIDC_ERR_SCHEMA:    return "invalid schema or type index";
+    default:                   return "unknown error";
+    }
+}
+
+int residc_encode_header(uint8_t *out, int capacity)
+{
+    if (capacity < 1) return RESIDC_ERR_CAPACITY;
+    out[0] = RESIDC_WIRE_VERSION;
+    return 1;
+}
+
+int residc_decode_header(const uint8_t *in, int in_len)
+{
+    if (in_len < 1) return RESIDC_ERR_TRUNCATED;
+    if (in[0] != RESIDC_WIRE_VERSION) return RESIDC_ERR_CORRUPT;
+    return 1;
 }

@@ -12,9 +12,9 @@
  *   - Deterministic: bit-identical output on all conforming implementations
  *   - Integer-only: no floating-point arithmetic
  *
- * Measured performance (NASDAQ ITCH 5.0, 8M real messages):
- *   - 3.27:1 compression ratio (32.2 -> 9.9 bytes average)
- *   - 330+ MB/s encode, 348+ MB/s decode
+ * Measured performance (synthetic 5-field quotes, 100K messages):
+ *   - 2.68:1 compression ratio (19 -> 7.1 bytes average)
+ *   - ~51 ns/msg encode, ~48 ns/msg decode
  *   - Zero roundtrip errors
  *
  * Quick start:
@@ -105,7 +105,7 @@ extern "C" {
 
 /* Scratch buffer for bit packing */
 #ifndef RESIDC_SCRATCH_BYTES
-#define RESIDC_SCRATCH_BYTES    256
+#define RESIDC_SCRATCH_BYTES    320
 #endif
 
 /* Regime detection window */
@@ -123,9 +123,23 @@ extern "C" {
 /* Frame markers */
 #define RESIDC_FRAME_LITERAL    0xFF
 
+/* Wire format version (negotiate at session level, not per-message) */
+#define RESIDC_WIRE_VERSION     1
+
 /* Residual coder selection */
 #define RESIDC_CODER_TIERED     0   /* Default: 5-tier variable-width code */
 #define RESIDC_CODER_EXPGOLOMB  1   /* Exp-Golomb: better compression, slightly slower decode */
+
+/* Error codes (all negative, so existing `if (ret < 0)` checks still work) */
+typedef enum {
+    RESIDC_OK            =  0,
+    RESIDC_ERR_NULL      = -1,  /* NULL state or schema pointer */
+    RESIDC_ERR_CAPACITY  = -2,  /* output buffer too small */
+    RESIDC_ERR_TRUNCATED = -3,  /* input stream truncated */
+    RESIDC_ERR_CORRUPT   = -4,  /* corrupt compressed data */
+    RESIDC_ERR_OVERFLOW  = -5,  /* internal buffer overflow */
+    RESIDC_ERR_SCHEMA    = -6,  /* invalid schema or type index */
+} residc_error_t;
 
 /* ================================================================
  * Field Types
@@ -318,7 +332,19 @@ typedef struct {
     uint32_t adapt_count;     /* Running count for adaptive k */
 } residc_field_state_t;
 
-/* Full codec state */
+/*
+ * Full codec state.
+ *
+ * WARNING: This struct is large (~331KB with default RESIDC_MAX_INSTRUMENTS).
+ * Do NOT allocate on the stack. Use malloc/calloc:
+ *
+ *   residc_state_t *state = calloc(1, sizeof(residc_state_t));
+ *   residc_init(state, &schema);
+ *   ...
+ *   free(state);
+ *
+ * Or reduce RESIDC_MAX_INSTRUMENTS if your application uses fewer instruments.
+ */
 typedef struct {
     /* Schema pointer (set during init) */
     const residc_schema_t       *schema;
@@ -380,6 +406,7 @@ typedef struct {
     uint64_t       accum;
     int            count;
     int            byte_pos;
+    int            error;      /* nonzero if stream exhausted */
 } residc_bitreader_t;
 
 /* ================================================================
@@ -450,6 +477,23 @@ void residc_reset(residc_state_t *state);
  */
 int residc_raw_size(const residc_schema_t *schema);
 
+/*
+ * Return a human-readable string for an error code.
+ */
+const char *residc_strerror(int err);
+
+/*
+ * Optional: write a 1-byte version header at stream start.
+ * Returns bytes written (1), or negative error code.
+ */
+int residc_encode_header(uint8_t *out, int capacity);
+
+/*
+ * Optional: read and validate version header.
+ * Returns bytes consumed (1), or RESIDC_ERR_CORRUPT on mismatch.
+ */
+int residc_decode_header(const uint8_t *in, int in_len);
+
 /* ================================================================
  * Building Blocks (for advanced users building custom codecs)
  *
@@ -469,7 +513,7 @@ int     residc_br_read_bit(residc_bitreader_t *br);
 
 /* --- Zigzag encoding (signed <-> unsigned) --- */
 static inline uint64_t residc_zigzag_enc(int64_t v)
-{ return (uint64_t)((v << 1) ^ (v >> 63)); }
+{ return ((uint64_t)v << 1) ^ (uint64_t)(v >> 63); }
 
 static inline int64_t residc_zigzag_dec(uint64_t u)
 { return (int64_t)((u >> 1) ^ -(u & 1)); }
@@ -526,7 +570,7 @@ void    residc_mfu_update(residc_mfu_table_t *mfu, uint16_t id);
  *
  * For gap recovery: snapshot codec state periodically, restore
  * and replay from the snapshot if messages are lost.
- * The snapshot is a full copy of the state struct (~332KB).
+ * The snapshot is a full copy of the state struct (~331KB with default config).
  * ================================================================ */
 
 /*

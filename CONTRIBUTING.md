@@ -29,7 +29,11 @@ make        # builds libresdc.so and libresdc.a
 
 ### C
 
-No test runner. Run the example programs:
+```bash
+make test     # runs all C unit tests in test/
+```
+
+Or manually:
 
 ```bash
 cc -O2 -o quote_example examples/custom/quote_example.c core/residc.c -Icore
@@ -40,7 +44,7 @@ cc -O2 -o quote_example examples/custom/quote_example.c core/residc.c -Icore
 
 ```bash
 cd rust
-cargo test    # 16 tests
+cargo test    # 7 tests + 1 doctest
 ```
 
 ### Python SDK

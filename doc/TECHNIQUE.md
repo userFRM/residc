@@ -2,7 +2,7 @@
 
 ## Abstract
 
-We describe a per-message, streaming compression technique for financial market data that achieves 3.27:1 compression on real NASDAQ ITCH 5.0 data (8 million messages) with zero roundtrip errors. Unlike general-purpose compressors that require block context, our approach exploits the structured, correlated nature of financial messages through per-field prediction and tiered residual coding. Each message is independently decodable given the codec state, enabling random access without block boundaries.
+We describe a per-message, streaming compression technique for financial market data that achieves 2.68:1 compression on realistic synthetic financial data (100K messages) with zero roundtrip errors. Unlike general-purpose compressors that require block context, our approach exploits the structured, correlated nature of financial messages through per-field prediction and tiered residual coding. Each message is independently decodable given the codec state, enabling random access without block boundaries.
 
 ## 1. Problem Statement
 
@@ -10,13 +10,13 @@ Financial messaging protocols generate massive volumes of small, structured mess
 
 **Why general-purpose compressors fail on small messages:**
 
-| Compressor | ITCH ratio | Notes |
+| Compressor | Ratio | Notes |
 |-----------|-----------|-------|
 | LZ4 per-message | 1.02:1 | No dictionary context, message too small |
 | zstd per-message | ~1.1:1 | Slightly better, still minimal |
 | LZ4 block (64KB) | 1.80:1 | Needs buffering, loses random access |
 | zstd block (64KB) | ~2.5:1 | Same trade-off |
-| **residc** | **3.27:1** | Per-message, streaming |
+| **residc** | **2.2-2.7:1** | Per-message, streaming |
 
 LZ4 and zstd look for repeated byte sequences. A 36-byte message doesn't have enough bytes for substring matching to work. Our approach instead uses **semantic prediction** — we know what each field means and can predict its value from context.
 
@@ -88,15 +88,14 @@ All residuals are encoded with the same tiered variable-width code:
 
 **Tiered code** (parameterized by k):
 ```
-Tier 0:  0                     value = 0               cost: 1 bit
-Tier 1:  10  + k bits          values [1, 2^k]         cost: 2+k bits
-Tier 2:  110 + 2k bits         next 2^(2k) values      cost: 3+2k bits
-Tier 3:  1110 + 3k bits        next 2^(3k) values      cost: 4+3k bits
-Tier 4:  11110 + 32 bits       any 32-bit value         cost: 37 bits
-Tier 5:  11111 + 64 bits       any 64-bit value         cost: 69 bits
+Tier 0:  0   + k bits          values [0, 2^k)         cost: 1+k bits
+Tier 1:  10  + (k+2) bits      values [0, 2^(k+2))     cost: 2+k+2 bits
+Tier 2:  110 + (k+5) bits      values [0, 2^(k+5))     cost: 3+k+5 bits
+Tier 3:  1110 + (k+10) bits    values [0, 2^(k+10))    cost: 4+k+10 bits
+Tier 4:  1111 + 64 bits        any 64-bit value         cost: 68 bits
 ```
 
-Tier 0 encodes the most common case (prediction is exact, residual = 0) in a single bit. Tiers 1-3 use progressively wider payload fields parameterized by k. Tiers 4-5 are escape tiers for outliers.
+Tier 0 encodes the most common case (small residuals) in 1+k bits. Tiers 1-3 use progressively wider payload fields. Tier 4 is an escape for outliers.
 
 The `k` parameter controls the trade-off: smaller k is better when residuals are small (accurate predictions); larger k is better when residuals are large (volatile markets).
 
@@ -155,47 +154,45 @@ If a message is lost (detected by sequence number gap), the receiver requests re
 
 ## 5. Results
 
-### NASDAQ ITCH 5.0 (8M real messages)
+### Synthetic Financial Data
 
-| Metric | C (gcc -O2, best of 10) | Rust (criterion mean) |
+| Metric | C (gcc -O2, best of 10) | Rust (via FFI, criterion mean) |
 |--------|------------------------|----------------------|
 | Messages | 100,000 (synthetic) | 10,000 (synthetic) |
-| Ratio | 2.71:1 | 2.37:1 |
-| Encode latency | 51 ns/msg | **49 ns/msg** |
-| Decode latency | 48 ns/msg | **42 ns/msg** |
+| Ratio | 2.68:1 | 2.37:1 |
+| Encode latency | 51 ns/msg | 122 ns/msg (includes ~70ns FFI overhead) |
+| Decode latency | 48 ns/msg | 91 ns/msg (includes ~40ns FFI overhead) |
 | Roundtrip errors | 0 | 0 |
 
-C uses `clock_gettime` best-of-10; Rust uses criterion statistical analysis (100 samples). Both compiled with `-march=native` / `target-cpu=native`. On real NASDAQ ITCH 5.0 data (8M messages, 32B avg), the C codec achieves 3.27:1 compression.
+C uses `clock_gettime` best-of-10; Rust uses criterion statistical analysis (100 samples). Both compiled with `-march=native` / `target-cpu=native`.
 
-**Note:** The C and Rust implementations use different wire formats and are not interoperable. Each is self-consistent (encoder ↔ decoder within the same implementation). The [C SDK](../sdk/) provides the canonical wire format with cross-language bindings.
+**Note:** The Rust SDK wraps the C core via FFI, so the wire format is identical. Performance differences are due to FFI call overhead. The [C SDK](../sdk/) provides the canonical API with cross-language bindings.
 
 ### Compression breakdown by technique
 
-Contribution of each technique to the overall ratio (measured by disabling one at a time):
+The core techniques and their approximate contribution (measured on synthetic data by disabling one at a time):
 
 | Technique | Ratio without | Contribution |
 |-----------|--------------|-------------|
 | Baseline (raw) | 1.00:1 | — |
 | + Tiered residual coding | ~2.0:1 | +100% |
 | + Per-instrument prediction | ~2.4:1 | +20% |
-| + Timestamp EMA | ~2.6:1 | +8% |
-| + MFU instrument table | ~2.8:1 | +8% |
-| + Stock symbol elimination | ~2.9:1 | +4% |
-| + Penny/round-lot normalization | ~3.0:1 | +3% |
-| + MPID table | ~3.1:1 | +3% |
-| + Shares zero-residual flag | ~3.2:1 | +3% |
-| + NOII/admin per-stock prediction | ~3.27:1 | +2% |
+| + Timestamp EMA | ~2.5:1 | +4% |
+| + MFU instrument table | ~2.6:1 | +4% |
+| + Penny/round-lot normalization | ~2.68:1 | +3% |
+
+> **Note:** The [codec-forge ITCH codec](https://github.com/userFRM/codec-forge) extends residc with ITCH-specific techniques (stock symbol elimination, MPID table, NOII prediction) to achieve 3.27:1 on real NASDAQ ITCH 5.0 data (8M messages).
 
 ### Comparison to general-purpose compressors
 
-On the same ITCH data:
+On financial message data:
 
-| Codec | Ratio | Per-msg? | Throughput |
-|-------|-------|----------|-----------|
-| residc | 3.27:1 | Yes | 331 MB/s |
-| LZ4 per-msg | 1.02:1 | Yes | 144 MB/s |
-| LZ4 block | 1.80:1 | No | 538 MB/s |
-| zstd block | ~2.5:1 | No | ~350 MB/s |
+| Codec | Ratio | Per-msg? | Latency |
+|-------|-------|----------|---------|
+| residc | 2.2-2.7:1 | Yes | ~51 ns/msg |
+| LZ4 per-msg | 1.02:1 | Yes | ~70 ns/msg |
+| LZ4 block | 1.80:1 | No | N/A (batch) |
+| zstd block | ~2.5:1 | No | N/A (batch) |
 
 ## 6. Related Work
 
@@ -217,7 +214,7 @@ On the same ITCH data:
 
 - **State dependency**: Messages must be decoded in order from a known state. Loss of a single message desynchronizes encoder and decoder. The `residc_snapshot()` / `residc_restore()` API enables checkpoint-based recovery: snapshot periodically, restore on gap detection, replay from the checkpoint. This is inherent to any streaming prediction approach.
 
-- **Memory footprint**: ~330KB per codec instance (16,384 instrument state slots + MFU table + field state). Configurable via `MAX_INSTRUMENTS` constant.
+- **Memory footprint**: ~331KB per codec instance (dominated by 16,384 instrument state slots at 20 bytes each, plus MFU table and field state). Configurable via `RESIDC_MAX_INSTRUMENTS`. Do not allocate on the stack — use `malloc`/`calloc`.
 
 - **Domain-specific**: The prediction strategies assume financial data patterns (quasi-periodic timestamps, Zipf instrument distribution, mean-reverting prices, sequential IDs). Applying to non-financial domains would require different field types.
 
@@ -231,4 +228,4 @@ On the same ITCH data:
 
 - **No authentication**: residc provides compression, not integrity. Combine with TLS, HMAC, or other authentication mechanisms for untrusted transports.
 
-- **Fuzzing**: The Rust implementation includes cargo-fuzz targets (`roundtrip` and `decode_arbitrary`) for continuous verification of roundtrip correctness and decode robustness against arbitrary input.
+- **Fuzzing**: libFuzzer targets for C (`fuzz/fuzz_decode.c`, `fuzz/fuzz_roundtrip.c`) are provided for decode robustness and roundtrip correctness verification.

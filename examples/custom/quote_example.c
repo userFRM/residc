@@ -69,10 +69,12 @@ int main(void)
 {
     const int N = 100000;
 
-    /* Create encoder and decoder with separate states */
-    residc_state_t enc, dec;
-    residc_init(&enc, &quote_schema);
-    residc_init(&dec, &quote_schema);
+    /* Create encoder and decoder (heap-allocated — residc_state_t is ~331KB) */
+    residc_state_t *enc = calloc(1, sizeof(residc_state_t));
+    residc_state_t *dec = calloc(1, sizeof(residc_state_t));
+    if (!enc || !dec) { fprintf(stderr, "allocation failed\n"); return 1; }
+    residc_init(enc, &quote_schema);
+    residc_init(dec, &quote_schema);
 
     long total_raw = 0;
     long total_compressed = 0;
@@ -110,7 +112,7 @@ int main(void)
 
         /* Encode */
         uint8_t buf[64];
-        int clen = residc_encode(&enc, &q, buf, sizeof(buf));
+        int clen = residc_encode(enc, &q, buf, sizeof(buf));
         if (clen < 0) { errors++; continue; }
 
         total_raw += residc_raw_size(&quote_schema);
@@ -118,7 +120,7 @@ int main(void)
 
         /* Decode */
         Quote decoded;
-        int dlen = residc_decode(&dec, buf, clen, &decoded);
+        int dlen = residc_decode(dec, buf, clen, &decoded);
         if (dlen < 0) { errors++; continue; }
 
         /* Verify roundtrip */
@@ -158,5 +160,7 @@ int main(void)
     else
         printf("\n  WARNING: %d roundtrip errors!\n", errors);
 
+    free(enc);
+    free(dec);
     return errors > 0 ? 1 : 0;
 }
