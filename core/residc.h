@@ -59,7 +59,7 @@
  *   residc_decode(&dec, buf, len, &decoded);
  *   // decoded == q  (bit-perfect roundtrip)
  *
- * License: MIT
+ * License: MIT OR Apache-2.0
  * https://github.com/theta-gamma/residc
  */
 
