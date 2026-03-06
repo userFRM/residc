@@ -3,13 +3,13 @@ use crate::ADAPT_WINDOW;
 
 /// Zigzag-encode a signed value to unsigned.
 /// Maps 0 -> 0, -1 -> 1, 1 -> 2, -2 -> 3, ...
-#[inline]
+#[inline(always)]
 pub fn zigzag_enc(v: i64) -> u64 {
     ((v << 1) ^ (v >> 63)) as u64
 }
 
 /// Zigzag-decode an unsigned value back to signed.
-#[inline]
+#[inline(always)]
 pub fn zigzag_dec(v: u64) -> i64 {
     ((v >> 1) as i64) ^ -((v & 1) as i64)
 }
@@ -23,6 +23,7 @@ pub fn zigzag_dec(v: u64) -> i64 {
 ///   T3: 1110 + 3k bits → 4+3k bits
 ///   T4: 11110 + 32 bits → 37 bits (escape tier)
 ///   T5: 11111 + 64 bits → 69 bits (full 64-bit escape)
+#[inline(always)]
 pub fn encode(bw: &mut BitWriter, value: i64, k: u32) {
     let zz = zigzag_enc(value);
 
@@ -54,6 +55,7 @@ pub fn encode(bw: &mut BitWriter, value: i64, k: u32) {
 }
 
 /// Tiered residual decoding — mirror of encode.
+#[inline(always)]
 pub fn decode(br: &mut BitReader, k: u32) -> i64 {
     if br.read_bit() == 0 {
         return 0;
@@ -84,7 +86,7 @@ pub fn decode(br: &mut BitReader, k: u32) -> i64 {
 
 /// Compute adaptive k based on recent residual magnitudes.
 /// Returns a value in [k_min, k_max].
-#[inline]
+#[inline(always)]
 pub fn adaptive_k(sum: u64, count: u32, k_min: u32, k_max: u32) -> u32 {
     if count == 0 {
         return k_min;
@@ -95,7 +97,7 @@ pub fn adaptive_k(sum: u64, count: u32, k_min: u32, k_max: u32) -> u32 {
 }
 
 /// Update the running adaptive window (sum and count).
-#[inline]
+#[inline(always)]
 pub fn adaptive_update(sum: &mut u64, count: &mut u32, zz: u64) {
     *sum += zz;
     *count += 1;
