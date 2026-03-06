@@ -1,38 +1,34 @@
-/// Bit-level writer using a 64-bit accumulator with unchecked buffer writes.
-pub struct BitWriter {
-    pub buf: [u8; 256],
+/// Bit-level writer that writes directly to an external buffer.
+/// No internal buffer, no zeroing, no copy.
+pub struct BitWriter<'a> {
+    buf: &'a mut [u8],
     accum: u64,
     bits_in_accum: u32,
     byte_pos: usize,
 }
 
-impl BitWriter {
+impl<'a> BitWriter<'a> {
     #[inline]
-    pub fn new() -> Self {
-        Self {
-            buf: [0u8; 256],
-            accum: 0,
-            bits_in_accum: 0,
-            byte_pos: 0,
-        }
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, accum: 0, bits_in_accum: 0, byte_pos: 0 }
     }
 
-    /// Write up to 57 bits. This is the fast path — covers all residual tier
-    /// prefixes + payloads and all field encodings except the 64-bit escape.
+    /// Write bits to the accumulator. Fast path for <= 57 bits (covers all
+    /// residual tiers and field encodings). Slow path splits for 64-bit escape.
     #[inline(always)]
     pub fn write(&mut self, value: u64, num_bits: u32) {
         debug_assert!(num_bits <= 64);
 
         if num_bits + self.bits_in_accum <= 64 {
-            // Fast path: fits in accumulator
-            let masked = if num_bits >= 64 { value } else { value & ((1u64 << num_bits) - 1) };
+            // Fast path: fits in accumulator.
+            // num_bits < 64 here because the 64-bit escape tier always has
+            // bits_in_accum > 0 (from the 5-bit prefix), forcing the slow path.
+            let masked = value & ((1u64 << num_bits) - 1);
             self.accum = (self.accum << num_bits) | masked;
             self.bits_in_accum += num_bits;
             // Flush complete bytes
             while self.bits_in_accum >= 8 {
                 self.bits_in_accum -= 8;
-                // SAFETY: byte_pos < 256 guaranteed by max message size (< 256 bytes).
-                // Schema raw_size < 256 and compressed is always <= raw_size.
                 unsafe {
                     *self.buf.as_mut_ptr().add(self.byte_pos) =
                         (self.accum >> self.bits_in_accum) as u8;
@@ -49,15 +45,15 @@ impl BitWriter {
     }
 
     /// Finalize: flush remaining bits and return total bytes written.
+    /// Consumes self to release the buffer borrow.
     #[inline]
-    pub fn finish(&mut self) -> usize {
+    pub fn finish(mut self) -> usize {
         if self.bits_in_accum > 0 {
             unsafe {
                 *self.buf.as_mut_ptr().add(self.byte_pos) =
                     (self.accum << (8 - self.bits_in_accum)) as u8;
             }
             self.byte_pos += 1;
-            self.bits_in_accum = 0;
         }
         self.byte_pos
     }
@@ -81,7 +77,6 @@ impl<'a> BitReader<'a> {
     #[inline(always)]
     fn refill(&mut self, need: u32) {
         while self.bits_in_accum < need && self.byte_pos < self.data.len() {
-            // SAFETY: byte_pos < data.len() checked above
             let byte = unsafe { *self.data.as_ptr().add(self.byte_pos) };
             self.accum = (self.accum << 8) | byte as u64;
             self.bits_in_accum += 8;
@@ -101,7 +96,7 @@ impl<'a> BitReader<'a> {
     /// Read `num_bits` and return as u64.
     #[inline(always)]
     pub fn read(&mut self, num_bits: u32) -> u64 {
-        if num_bits == 0 { return 0; }
+        debug_assert!(num_bits > 0 && num_bits <= 64);
         self.refill(num_bits);
         if self.bits_in_accum < num_bits {
             // Need more bits than available — split (64-bit escape only)
@@ -127,14 +122,17 @@ mod tests {
 
     #[test]
     fn roundtrip_bits() {
-        let mut bw = BitWriter::new();
-        bw.write(0b101, 3);
-        bw.write(0b1100, 4);
-        bw.write(0xFF, 8);
-        bw.write(1, 1);
-        let len = bw.finish();
+        let mut buf = [0u8; 256];
+        let len = {
+            let mut bw = BitWriter::new(&mut buf);
+            bw.write(0b101, 3);
+            bw.write(0b1100, 4);
+            bw.write(0xFF, 8);
+            bw.write(1, 1);
+            bw.finish()
+        };
 
-        let mut br = BitReader::new(&bw.buf[..len]);
+        let mut br = BitReader::new(&buf[..len]);
         assert_eq!(br.read(3), 0b101);
         assert_eq!(br.read(4), 0b1100);
         assert_eq!(br.read(8), 0xFF);
@@ -143,13 +141,16 @@ mod tests {
 
     #[test]
     fn single_bits() {
-        let mut bw = BitWriter::new();
-        bw.write(1, 1);
-        bw.write(0, 1);
-        bw.write(1, 1);
-        let len = bw.finish();
+        let mut buf = [0u8; 256];
+        let len = {
+            let mut bw = BitWriter::new(&mut buf);
+            bw.write(1, 1);
+            bw.write(0, 1);
+            bw.write(1, 1);
+            bw.finish()
+        };
 
-        let mut br = BitReader::new(&bw.buf[..len]);
+        let mut br = BitReader::new(&buf[..len]);
         assert_eq!(br.read_bit(), 1);
         assert_eq!(br.read_bit(), 0);
         assert_eq!(br.read_bit(), 1);
@@ -157,26 +158,32 @@ mod tests {
 
     #[test]
     fn large_values() {
-        let mut bw = BitWriter::new();
-        bw.write(0xDEADBEEF, 32);
-        bw.write(0x1234, 16);
-        let len = bw.finish();
+        let mut buf = [0u8; 256];
+        let len = {
+            let mut bw = BitWriter::new(&mut buf);
+            bw.write(0xDEADBEEF, 32);
+            bw.write(0x1234, 16);
+            bw.finish()
+        };
 
-        let mut br = BitReader::new(&bw.buf[..len]);
+        let mut br = BitReader::new(&buf[..len]);
         assert_eq!(br.read(32), 0xDEADBEEF);
         assert_eq!(br.read(16), 0x1234);
     }
 
     #[test]
     fn mixed_small_large() {
-        let mut bw = BitWriter::new();
-        bw.write(1, 1);
-        bw.write(0xABCD, 16);
-        bw.write(0, 3);
-        bw.write(0b11, 2);
-        let len = bw.finish();
+        let mut buf = [0u8; 256];
+        let len = {
+            let mut bw = BitWriter::new(&mut buf);
+            bw.write(1, 1);
+            bw.write(0xABCD, 16);
+            bw.write(0, 3);
+            bw.write(0b11, 2);
+            bw.finish()
+        };
 
-        let mut br = BitReader::new(&bw.buf[..len]);
+        let mut br = BitReader::new(&buf[..len]);
         assert_eq!(br.read_bit(), 1);
         assert_eq!(br.read(16), 0xABCD);
         assert_eq!(br.read(3), 0);
@@ -185,13 +192,16 @@ mod tests {
 
     #[test]
     fn stress_many_small_writes() {
-        let mut bw = BitWriter::new();
-        for i in 0..100u64 {
-            bw.write(i & 0x7, 3);
-        }
-        let len = bw.finish();
+        let mut buf = [0u8; 256];
+        let len = {
+            let mut bw = BitWriter::new(&mut buf);
+            for i in 0..100u64 {
+                bw.write(i & 0x7, 3);
+            }
+            bw.finish()
+        };
 
-        let mut br = BitReader::new(&bw.buf[..len]);
+        let mut br = BitReader::new(&buf[..len]);
         for i in 0..100u64 {
             assert_eq!(br.read(3), i & 0x7, "mismatch at i={i}");
         }

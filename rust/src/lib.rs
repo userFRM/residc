@@ -326,13 +326,17 @@ impl Codec {
     pub fn encode(&mut self, msg: &Message, out: &mut [u8]) -> Result<usize, &'static str> {
         if out.len() < 2 { return Err("buffer too small"); }
 
-        let mut bw = bits::BitWriter::new();
-        self.encode_fields(msg, &mut bw);
+        // Single-pass: encode fields + update state in one loop
+        let payload_len = {
+            let mut bw = bits::BitWriter::new(&mut out[1..]);
+            self.encode_and_commit(msg, &mut bw);
+            bw.finish()
+        };
 
-        let payload_len = bw.finish();
         let raw_size = self.schema.raw_size();
 
         if payload_len >= raw_size || payload_len >= 254 {
+            // State already committed — just overwrite with literal bytes
             let total = 1 + raw_size;
             if out.len() < total { return Err("buffer too small for literal"); }
             out[0] = FRAME_LITERAL;
@@ -347,25 +351,31 @@ impl Codec {
                     pos += 1;
                 }
             }
-            self.commit_state(msg);
             return Ok(pos);
         }
 
-        let total = 1 + payload_len;
-        if out.len() < total { return Err("buffer too small"); }
         out[0] = payload_len as u8;
-        out[1..total].copy_from_slice(&bw.buf[..payload_len]);
-        self.commit_state(msg);
-        Ok(total)
+        Ok(1 + payload_len)
     }
 
-    #[inline]
-    fn encode_fields(&self, msg: &Message, bw: &mut bits::BitWriter) {
-        let mut is: &InstrumentState = &InstrumentState::ZERO;
+    /// Encode all fields and update state in a single pass.
+    /// Eliminates the second loop through fields that commit_state does separately.
+    #[inline(always)]
+    fn encode_and_commit(&mut self, msg: &Message, bw: &mut bits::BitWriter<'_>) {
+        let mut instrument_id = self.last_instrument;
+        // Copy instrument state to avoid holding a borrow on self
+        let mut is = InstrumentState::ZERO;
+        // Cache regime-dependent k values — must be consistent with decoder
+        // which sees pre-commit regime for all fields
+        let k_ts = self.k_ts();
+        let k_price = self.k_price();
+        let k_qty = self.k_qty();
+        let k_seq = self.k_seq();
 
         for fi in 0..self.schema.num_fields {
-            let fd = &self.schema.fields[fi];
-            let val = msg.values[fi];
+            // SAFETY: fi < num_fields <= MAX_FIELDS
+            let fd = unsafe { *self.schema.fields.get_unchecked(fi) };
+            let val = unsafe { *msg.values.get_unchecked(fi) };
 
             match fd.field_type {
                 FieldType::Timestamp => {
@@ -373,37 +383,54 @@ impl Codec {
                     let predicted_gap = (self.ts_gap_ema >> 16).max(0);
                     let k = residual::adaptive_k(
                         self.ts_adapt_sum, self.ts_adapt_count,
-                        self.k_ts(), self.k_ts() + 10,
+                        k_ts, k_ts + 10,
                     );
-                    residual::encode(bw, gap - predicted_gap, k);
+                    let res = gap - predicted_gap;
+                    residual::encode(bw, res, k);
+
+                    // State update
+                    let zz = residual::zigzag_enc(res);
+                    residual::adaptive_update(
+                        &mut self.ts_adapt_sum, &mut self.ts_adapt_count, zz,
+                    );
+                    let gap_q16 = gap << 16;
+                    self.ts_gap_ema += (gap_q16 - self.ts_gap_ema) >> 2;
+                    self.last_timestamp = val;
                 }
 
                 FieldType::Instrument => {
                     let id = val as u16;
-                    is = self.instrument_state(id);
+                    instrument_id = id;
+                    is = *self.instrument_state(id);
 
                     if id == self.last_instrument && self.msg_count > 0 {
                         bw.write(0, 1);
                     } else {
-                        bw.write(1, 1);
                         match self.mfu.lookup(id) {
                             Some(idx) => {
-                                bw.write(0, 1);
-                                bw.write(idx as u64, MFU_INDEX_BITS);
+                                bw.write(0b10 << MFU_INDEX_BITS | idx as u64, 2 + MFU_INDEX_BITS);
                             }
                             None => {
-                                bw.write(1, 1);
-                                bw.write(id as u64, 14);
+                                bw.write((0b11 << 14) | id as u64, 2 + 14);
                             }
                         }
                     }
+
+                    // State update
+                    self.mfu.update(id);
+                    self.mfu_decay_counter += 1;
+                    if self.mfu_decay_counter >= 10000 {
+                        self.mfu.decay();
+                        self.mfu_decay_counter = 0;
+                    }
+                    self.last_instrument = id;
                 }
 
                 FieldType::Price => {
                     let price = val as u32;
                     let predicted = if is.msg_count > 0 { is.last_price } else { 0 };
                     let res = price as i64 - predicted as i64;
-                    let k = self.k_price();
+                    let k = k_price;
 
                     if price % 100 == 0 && predicted % 100 == 0
                         && (price > 0 || predicted > 0)
@@ -414,47 +441,69 @@ impl Codec {
                         bw.write(1, 1);
                         residual::encode(bw, res, k);
                     }
+
+                    // State update
+                    let abs_res = (val as i64 - predicted as i64).unsigned_abs() as u32;
+                    self.recent_abs_price_sum += abs_res;
+                    self.regime_counter += 1;
+                    if self.regime_counter >= REGIME_WINDOW {
+                        let avg = self.recent_abs_price_sum / REGIME_WINDOW;
+                        self.regime = if avg > 30 { Regime::Volatile } else { Regime::Calm };
+                        self.recent_abs_price_sum = 0;
+                        self.regime_counter = 0;
+                    }
+                    self.instrument_state_mut(instrument_id).last_price = val as u32;
                 }
 
                 FieldType::Quantity => {
                     let qty = val as u32;
                     let predicted = if is.msg_count > 0 { is.last_qty } else { 100 };
                     let res = qty as i64 - predicted as i64;
-                    let k = self.k_qty();
+                    let k = k_qty;
 
                     if res == 0 {
                         bw.write(0, 1);
+                    } else if qty % 100 == 0 && predicted % 100 == 0 {
+                        bw.write(0b10, 2);
+                        residual::encode(bw, res / 100, k);
                     } else {
-                        bw.write(1, 1);
-                        if qty % 100 == 0 && predicted % 100 == 0 {
-                            bw.write(0, 1);
-                            residual::encode(bw, res / 100, k);
-                        } else {
-                            bw.write(1, 1);
-                            residual::encode(bw, res, k);
-                        }
+                        bw.write(0b11, 2);
+                        residual::encode(bw, res, k);
                     }
+
+                    // State update
+                    self.instrument_state_mut(instrument_id).last_qty = val as u32;
                 }
 
                 FieldType::SequentialId => {
-                    let fs = &self.field_state[fi];
-                    let predicted = if is.last_seq_id > 0 { is.last_seq_id } else { fs.last_value };
+                    let inst_seq = is.last_seq_id;
+                    let fs_val = self.field_state[fi].last_value;
+                    let fs_sum = self.field_state[fi].adapt_sum;
+                    let fs_count = self.field_state[fi].adapt_count;
+                    let predicted = if inst_seq > 0 { inst_seq } else { fs_val };
                     let delta = val.wrapping_sub(predicted) as i64;
                     let k = residual::adaptive_k(
-                        fs.adapt_sum, fs.adapt_count,
-                        self.k_seq(), self.k_seq() + 10,
+                        fs_sum, fs_count,
+                        k_seq, k_seq + 10,
                     );
                     residual::encode(bw, delta, k);
+
+                    // State update
+                    let zz = residual::zigzag_enc(delta);
+                    let fs = &mut self.field_state[fi];
+                    residual::adaptive_update(&mut fs.adapt_sum, &mut fs.adapt_count, zz);
+                    fs.last_value = val;
+                    self.instrument_state_mut(instrument_id).last_seq_id = val;
                 }
 
                 FieldType::Enum => {
-                    let fs = &self.field_state[fi];
-                    if val == fs.last_value && self.msg_count > 0 {
+                    if val == self.field_state[fi].last_value && self.msg_count > 0 {
                         bw.write(0, 1);
                     } else {
                         bw.write(1, 1);
                         bw.write(val, 8);
                     }
+                    self.field_state[fi].last_value = val;
                 }
 
                 FieldType::Bool => {
@@ -462,14 +511,14 @@ impl Codec {
                 }
 
                 FieldType::Categorical => {
-                    let fs = &self.field_state[fi];
-                    if val == fs.last_value && self.msg_count > 0 {
+                    if val == self.field_state[fi].last_value && self.msg_count > 0 {
                         bw.write(0, 1);
                     } else {
                         bw.write(1, 1);
                         bw.write(val >> 16, 16);
                         bw.write(val & 0xFFFF, 16);
                     }
+                    self.field_state[fi].last_value = val;
                 }
 
                 FieldType::Raw { bytes } => {
@@ -479,18 +528,22 @@ impl Codec {
                 FieldType::DeltaId { ref_field } => {
                     let ref_val = msg.values[ref_field as usize];
                     let delta = val.wrapping_sub(ref_val) as i64;
-                    residual::encode(bw, delta, self.k_seq());
+                    residual::encode(bw, delta, k_seq);
+                    self.field_state[fi].last_value = val;
                 }
 
                 FieldType::DeltaPrice { ref_field } => {
                     let ref_val = msg.values[ref_field as usize];
                     let delta = val as i64 - ref_val as i64;
-                    residual::encode(bw, delta, self.k_price());
+                    residual::encode(bw, delta, k_price);
                 }
 
                 FieldType::Computed => {}
             }
         }
+
+        self.instrument_state_mut(instrument_id).msg_count += 1;
+        self.msg_count += 1;
     }
 
     // ============================================================
@@ -530,12 +583,13 @@ impl Codec {
         Ok(msg)
     }
 
-    #[inline]
+    #[inline(always)]
     fn decode_fields(&self, br: &mut bits::BitReader, msg: &mut Message) {
         let mut is: &InstrumentState = &InstrumentState::ZERO;
 
         for fi in 0..self.schema.num_fields {
-            let fd = &self.schema.fields[fi];
+            // SAFETY: fi < num_fields <= MAX_FIELDS
+            let fd = unsafe { self.schema.fields.get_unchecked(fi) };
             let val: u64 = match fd.field_type {
                 FieldType::Timestamp => {
                     let predicted_gap = (self.ts_gap_ema >> 16).max(0);
@@ -639,7 +693,8 @@ impl Codec {
                 FieldType::Computed => continue,
             };
 
-            msg.values[fi] = val;
+            // SAFETY: fi < num_fields <= MAX_FIELDS
+            unsafe { *msg.values.get_unchecked_mut(fi) = val; }
         }
     }
 
@@ -647,12 +702,14 @@ impl Codec {
     // State commit (called after successful encode or decode)
     // ============================================================
 
+    #[inline(always)]
     fn commit_state(&mut self, msg: &Message) {
         let mut instrument_id = self.last_instrument;
 
         for fi in 0..self.schema.num_fields {
-            let fd = self.schema.fields[fi];
-            let val = msg.values[fi];
+            // SAFETY: fi < num_fields <= MAX_FIELDS
+            let fd = unsafe { *self.schema.fields.get_unchecked(fi) };
+            let val = unsafe { *msg.values.get_unchecked(fi) };
 
             match fd.field_type {
                 FieldType::Timestamp => {

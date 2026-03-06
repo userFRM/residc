@@ -19,12 +19,12 @@ Orders        43.7 B   13.4 B     3.26:1      0     (2M synthetic order flow)
 
 ### Latency
 
-|  | C (gcc -O2, 100K quotes) | Rust (--release, LTO, 10K quotes) |
-|--|--------------------------|-----------------------------------|
-| Encode | **50 ns/msg** | 96 ns/msg |
-| Decode | **46 ns/msg** | 55 ns/msg |
+|  | C (gcc -O2, 100K quotes) | Rust (--release, LTO, 100K quotes) |
+|--|--------------------------|-------------------------------------|
+| Encode | **51 ns/msg** | **52 ns/msg** |
+| Decode | 46 ns/msg | **39 ns/msg** |
 
-C is faster due to `always_inline` on the entire encode/decode hot path (bit I/O, residual coding, tier selection — all inlined into a single function). Zero function call overhead.
+Both implementations use `always_inline` / `#[inline(always)]` on the entire hot path. Rust achieves parity on encode and is faster on decode through hash-accelerated MFU lookup, direct-write BitWriter (no intermediate buffer), and single-pass encode+commit.
 
 ## Comparison to Alternatives
 
@@ -32,7 +32,7 @@ C is faster due to `always_inline` on the entire encode/decode hot path (bit I/O
 
 | Codec | Ratio (ITCH) | Encode | Decode | Per-msg | Approach |
 |-------|-------------|--------|--------|---------|----------|
-| **residc** | **3.27:1** | **50 ns** | **46 ns** | Yes | Prediction-residual |
+| **residc** | **3.27:1** | **51 ns** | **39 ns** | Yes | Prediction-residual |
 | SBE | 1.00:1 | ~25 ns | ~0 ns | Yes | Zero-copy cast, no compression |
 | FAST (FIX) | 2-4:1 | ~200 ns | ~200 ns | Yes | Template delta + stop-bit coding |
 | Protobuf | ~1.3:1 | ~150 ns | ~120 ns | Yes | Varint, no cross-message state |
@@ -68,11 +68,11 @@ SBE is faster to encode but sends larger messages. The real metric is **end-to-e
 
 | Link | SBE total | residc total | Winner |
 |------|----------|-------------|--------|
-| 10 GbE, 19B msg | 25ns + 15ns = **40ns** | 50ns + 5ns + 46ns = **101ns** | SBE |
-| 1 GbE, 19B msg | 25ns + 152ns = **177ns** | 50ns + 51ns + 46ns = **147ns** | **residc** |
-| 1 GbE, 60B msg | 25ns + 480ns = **505ns** | 50ns + 160ns + 46ns = **256ns** | **residc** |
-| 100 Mbps WAN | 25ns + 4.8us = **4.8us** | 50ns + 1.6us + 46ns = **1.7us** | **residc** |
-| Multicast x10, 1GbE | 25ns + 10*480ns = **4.8us** | 50ns + 10*160ns + 46ns = **1.7us** | **residc** |
+| 10 GbE, 19B msg | 25ns + 15ns = **40ns** | 52ns + 5ns + 39ns = **96ns** | SBE |
+| 1 GbE, 19B msg | 25ns + 152ns = **177ns** | 52ns + 51ns + 39ns = **142ns** | **residc** |
+| 1 GbE, 60B msg | 25ns + 480ns = **505ns** | 52ns + 160ns + 39ns = **251ns** | **residc** |
+| 100 Mbps WAN | 25ns + 4.8us = **4.8us** | 52ns + 1.6us + 39ns = **1.7us** | **residc** |
+| Multicast x10, 1GbE | 25ns + 10*480ns = **4.8us** | 52ns + 10*160ns + 39ns = **1.7us** | **residc** |
 
 **The crossover point is ~1 GbE.** Above that, SBE wins on encode speed. Below that, residc wins because 3x smaller messages travel 3x faster on the wire. For data distribution — where vendors serve thousands of consumers over WAN, cloud, or multicast — the compression pays for itself many times over.
 
@@ -94,8 +94,8 @@ FAST (FIX Adapted for STreaming) was the FIX Trading Community's answer to this 
 | Dependencies | 0 | 0 |
 | `no_std` | N/A | Yes |
 | Heap allocations | 0 | 0 |
-| Encode latency | **50 ns** | 96 ns |
-| Decode latency | **46 ns** | 55 ns |
+| Encode latency | 51 ns | **52 ns** |
+| Decode latency | 46 ns | **39 ns** |
 
 ## Quick Start (C)
 

@@ -24,7 +24,7 @@ pub fn zigzag_dec(v: u64) -> i64 {
 ///   T4: 11110 + 32 bits → 37 bits (escape tier)
 ///   T5: 11111 + 64 bits → 69 bits (full 64-bit escape)
 #[inline(always)]
-pub fn encode(bw: &mut BitWriter, value: i64, k: u32) {
+pub fn encode(bw: &mut BitWriter<'_>, value: i64, k: u32) {
     let zz = zigzag_enc(value);
 
     if zz == 0 {
@@ -37,12 +37,13 @@ pub fn encode(bw: &mut BitWriter, value: i64, k: u32) {
     let t3_max = t2_max + (1u64 << (3 * k));
 
     if zz <= t1_max {
-        bw.write(0b10, 2);
-        bw.write(zz - 1, k);
+        // Combine prefix + payload into single write (max 2+20=22 bits)
+        bw.write((0b10 << k) | (zz - 1), 2 + k);
     } else if zz <= t2_max {
-        bw.write(0b110, 3);
-        bw.write(zz - t1_max - 1, 2 * k);
+        // Combine prefix + payload (max 3+40=43 bits)
+        bw.write((0b110 << (2 * k)) | (zz - t1_max - 1), 3 + 2 * k);
     } else if zz <= t3_max {
+        // Tier 3 can exceed 57 bits (4+3*20=64), keep as two writes
         bw.write(0b1110, 4);
         bw.write(zz - t2_max - 1, 3 * k);
     } else if zz <= u32::MAX as u64 {
@@ -122,10 +123,13 @@ mod tests {
     fn residual_roundtrip() {
         for k in [2, 3, 5, 8] {
             for &v in &[0i64, 1, -1, 7, -7, 100, -100, 100_000, -100_000] {
-                let mut bw = BitWriter::new();
-                encode(&mut bw, v, k);
-                let len = bw.finish();
-                let mut br = BitReader::new(&bw.buf[..len]);
+                let mut buf = [0u8; 256];
+                let len = {
+                    let mut bw = BitWriter::new(&mut buf);
+                    encode(&mut bw, v, k);
+                    bw.finish()
+                };
+                let mut br = BitReader::new(&buf[..len]);
                 let decoded = decode(&mut br, k);
                 assert_eq!(decoded, v, "k={k}, value={v}");
             }

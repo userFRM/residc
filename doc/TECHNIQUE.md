@@ -159,13 +159,13 @@ If a message is lost (detected by sequence number gap), the receiver requests re
 
 | Metric | C (gcc -O2) | Rust (--release, LTO) |
 |--------|------------|----------------------|
-| Messages | 100,000 (synthetic) | 10,000 (synthetic) |
-| Ratio | 2.71:1 | 2.3:1 |
-| Encode latency | **50 ns/msg** | 96 ns/msg |
-| Decode latency | **46 ns/msg** | 55 ns/msg |
+| Messages | 100,000 (synthetic) | 100,000 (synthetic) |
+| Ratio | 2.71:1 | 2.37:1 |
+| Encode latency | 51 ns/msg | **52 ns/msg** |
+| Decode latency | 46 ns/msg | **39 ns/msg** |
 | Roundtrip errors | 0 | 0 |
 
-The C implementation achieves lower latency through `always_inline` on the entire encode/decode hot path: bit I/O, residual coding, and tier selection are all inlined into a single function body with zero function call overhead. On real NASDAQ ITCH 5.0 data (8M messages, 32B avg), the C codec achieves 3.27:1 compression.
+Both implementations use `always_inline` / `#[inline(always)]` on the entire hot path. The Rust implementation additionally uses hash-accelerated MFU lookup, direct-write BitWriter (zero intermediate buffer), and single-pass encode+commit. On real NASDAQ ITCH 5.0 data (8M messages, 32B avg), the C codec achieves 3.27:1 compression.
 
 ### Compression breakdown by technique
 
@@ -213,7 +213,7 @@ On the same ITCH data:
 
 ## 7. Limitations
 
-- **Higher encode latency than SBE**: SBE achieves ~25ns through zero-copy pointer cast. residc is 96ns (Rust) / 100ns (C) due to prediction + bit-level coding. On 10GbE same-rack links where bandwidth is free, SBE delivers lower total latency.
+- **Higher encode latency than SBE**: SBE achieves ~25ns through zero-copy pointer cast. residc is ~51ns (C) / ~52ns (Rust) due to prediction + bit-level coding. On 10GbE same-rack links where bandwidth is free, SBE delivers lower total latency.
 
 - **State dependency**: Messages must be decoded in order from a known state. Loss of a single message desynchronizes encoder and decoder. Recovery requires retransmission from last known-good state or full state reset. This is inherent to any streaming prediction approach (same limitation as FAST Protocol).
 
