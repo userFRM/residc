@@ -94,7 +94,10 @@ pub struct FieldDef {
     pub field_type: FieldType,
 }
 
-const EMPTY_FIELD: FieldDef = FieldDef { name: "", field_type: FieldType::Computed };
+const EMPTY_FIELD: FieldDef = FieldDef {
+    name: "",
+    field_type: FieldType::Computed,
+};
 
 #[derive(Clone, Debug)]
 pub struct Schema {
@@ -181,7 +184,9 @@ pub struct Message {
 
 impl Message {
     pub fn new() -> Self {
-        Self { values: [0u64; MAX_FIELDS] }
+        Self {
+            values: [0u64; MAX_FIELDS],
+        }
     }
 
     #[inline]
@@ -220,7 +225,12 @@ struct InstrumentState {
 }
 
 impl InstrumentState {
-    const ZERO: Self = Self { last_price: 0, last_qty: 0, msg_count: 0, last_seq_id: 0 };
+    const ZERO: Self = Self {
+        last_price: 0,
+        last_qty: 0,
+        msg_count: 0,
+        last_seq_id: 0,
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -231,11 +241,18 @@ struct FieldState {
 }
 
 impl FieldState {
-    const ZERO: Self = Self { last_value: 0, adapt_sum: 0, adapt_count: 0 };
+    const ZERO: Self = Self {
+        last_value: 0,
+        adapt_sum: 0,
+        adapt_count: 0,
+    };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Regime { Calm, Volatile }
+enum Regime {
+    Calm,
+    Volatile,
+}
 
 #[derive(Clone)]
 pub struct Codec {
@@ -317,22 +334,38 @@ impl Codec {
 
     #[inline(always)]
     fn k_ts(&self) -> u32 {
-        if self.regime == Regime::Volatile { 8 } else { 10 }
+        if self.regime == Regime::Volatile {
+            8
+        } else {
+            10
+        }
     }
 
     #[inline(always)]
     fn k_price(&self) -> u32 {
-        if self.regime == Regime::Volatile { 7 } else { 3 }
+        if self.regime == Regime::Volatile {
+            7
+        } else {
+            3
+        }
     }
 
     #[inline(always)]
     fn k_qty(&self) -> u32 {
-        if self.regime == Regime::Volatile { 7 } else { 4 }
+        if self.regime == Regime::Volatile {
+            7
+        } else {
+            4
+        }
     }
 
     #[inline(always)]
     fn k_seq(&self) -> u32 {
-        if self.regime == Regime::Volatile { 5 } else { 3 }
+        if self.regime == Regime::Volatile {
+            5
+        } else {
+            3
+        }
     }
 
     #[inline(always)]
@@ -350,7 +383,9 @@ impl Codec {
     // ============================================================
 
     pub fn encode(&mut self, msg: &Message, out: &mut [u8]) -> Result<usize, &'static str> {
-        if out.len() < 2 { return Err("buffer too small"); }
+        if out.len() < 2 {
+            return Err("buffer too small");
+        }
 
         // Single-pass: encode fields + update state in one loop
         let (payload_len, overflow) = {
@@ -365,12 +400,16 @@ impl Codec {
         if overflow || payload_len >= raw_size || payload_len >= 254 {
             // State already committed — just overwrite with literal bytes
             let total = 1 + raw_size;
-            if out.len() < total { return Err("buffer too small for literal"); }
+            if out.len() < total {
+                return Err("buffer too small for literal");
+            }
             out[0] = FRAME_LITERAL;
             let mut pos = 1;
             for fi in 0..self.schema.num_fields {
                 let fd = &self.schema.fields[fi];
-                if matches!(fd.field_type, FieldType::Computed) { continue; }
+                if matches!(fd.field_type, FieldType::Computed) {
+                    continue;
+                }
                 let val = msg.values[fi];
                 let bytes = field_raw_bytes(fd.field_type);
                 for b in (0..bytes).rev() {
@@ -409,17 +448,17 @@ impl Codec {
                     let gap = val.wrapping_sub(self.last_timestamp) as i64;
                     let predicted_gap = (self.ts_gap_ema >> 16).max(0);
                     let k = residual::adaptive_k(
-                        self.ts_adapt_sum, self.ts_adapt_count,
-                        k_ts, k_ts + 10,
+                        self.ts_adapt_sum,
+                        self.ts_adapt_count,
+                        k_ts,
+                        k_ts + 10,
                     );
                     let res = gap - predicted_gap;
                     residual::encode(bw, res, k);
 
                     // State update
                     let zz = residual::zigzag_enc(res);
-                    residual::adaptive_update(
-                        &mut self.ts_adapt_sum, &mut self.ts_adapt_count, zz,
-                    );
+                    residual::adaptive_update(&mut self.ts_adapt_sum, &mut self.ts_adapt_count, zz);
                     let gap_q16 = gap << 16;
                     self.ts_gap_ema += (gap_q16 - self.ts_gap_ema) >> 2;
                     self.last_timestamp = val;
@@ -459,7 +498,8 @@ impl Codec {
                     let res = price as i64 - predicted as i64;
                     let k = k_price;
 
-                    if price % 100 == 0 && predicted % 100 == 0
+                    if price.is_multiple_of(100)
+                        && predicted.is_multiple_of(100)
                         && (price > 0 || predicted > 0)
                     {
                         bw.write(0, 1);
@@ -475,7 +515,11 @@ impl Codec {
                     self.regime_counter += 1;
                     if self.regime_counter >= REGIME_WINDOW {
                         let avg = self.recent_abs_price_sum / REGIME_WINDOW;
-                        self.regime = if avg > 30 { Regime::Volatile } else { Regime::Calm };
+                        self.regime = if avg > 30 {
+                            Regime::Volatile
+                        } else {
+                            Regime::Calm
+                        };
                         self.recent_abs_price_sum = 0;
                         self.regime_counter = 0;
                     }
@@ -490,7 +534,7 @@ impl Codec {
 
                     if res == 0 {
                         bw.write(0, 1);
-                    } else if qty % 100 == 0 && predicted % 100 == 0 {
+                    } else if qty.is_multiple_of(100) && predicted.is_multiple_of(100) {
                         bw.write(0b10, 2);
                         residual::encode(bw, res / 100, k);
                     } else {
@@ -509,10 +553,7 @@ impl Codec {
                     let fs_count = self.field_state[fi].adapt_count;
                     let predicted = if inst_seq > 0 { inst_seq } else { fs_val };
                     let delta = val.wrapping_sub(predicted) as i64;
-                    let k = residual::adaptive_k(
-                        fs_sum, fs_count,
-                        k_seq, k_seq + 10,
-                    );
+                    let k = residual::adaptive_k(fs_sum, fs_count, k_seq, k_seq + 10);
                     residual::encode(bw, delta, k);
 
                     // State update
@@ -578,7 +619,9 @@ impl Codec {
     // ============================================================
 
     pub fn decode(&mut self, input: &[u8]) -> Result<Message, &'static str> {
-        if input.is_empty() { return Err("empty input"); }
+        if input.is_empty() {
+            return Err("empty input");
+        }
 
         let frame = input[0];
         let mut msg = Message::new();
@@ -587,11 +630,15 @@ impl Codec {
             let mut pos = 1;
             for fi in 0..self.schema.num_fields {
                 let fd = &self.schema.fields[fi];
-                if matches!(fd.field_type, FieldType::Computed) { continue; }
+                if matches!(fd.field_type, FieldType::Computed) {
+                    continue;
+                }
                 let bytes = field_raw_bytes(fd.field_type);
                 let mut val = 0u64;
                 for b in (0..bytes).rev() {
-                    if pos >= input.len() { return Err("truncated literal"); }
+                    if pos >= input.len() {
+                        return Err("truncated literal");
+                    }
                     val |= (input[pos] as u64) << (b * 8);
                     pos += 1;
                 }
@@ -602,7 +649,9 @@ impl Codec {
         }
 
         let payload_len = frame as usize;
-        if 1 + payload_len > input.len() { return Err("truncated payload"); }
+        if 1 + payload_len > input.len() {
+            return Err("truncated payload");
+        }
 
         let mut br = bits::BitReader::new(&input[1..1 + payload_len]);
         self.decode_fields(&mut br, &mut msg);
@@ -621,8 +670,10 @@ impl Codec {
                 FieldType::Timestamp => {
                     let predicted_gap = (self.ts_gap_ema >> 16).max(0);
                     let k = residual::adaptive_k(
-                        self.ts_adapt_sum, self.ts_adapt_count,
-                        self.k_ts(), self.k_ts() + 10,
+                        self.ts_adapt_sum,
+                        self.ts_adapt_count,
+                        self.k_ts(),
+                        self.k_ts() + 10,
                     );
                     let res = residual::decode(br, k);
                     let gap = res + predicted_gap;
@@ -672,10 +723,16 @@ impl Codec {
 
                 FieldType::SequentialId => {
                     let fs = &self.field_state[fi];
-                    let predicted = if is.last_seq_id > 0 { is.last_seq_id } else { fs.last_value };
+                    let predicted = if is.last_seq_id > 0 {
+                        is.last_seq_id
+                    } else {
+                        fs.last_value
+                    };
                     let k = residual::adaptive_k(
-                        fs.adapt_sum, fs.adapt_count,
-                        self.k_seq(), self.k_seq() + 10,
+                        fs.adapt_sum,
+                        fs.adapt_count,
+                        self.k_seq(),
+                        self.k_seq() + 10,
                     );
                     let delta = residual::decode(br, k);
                     predicted.wrapping_add(delta as u64)
@@ -721,7 +778,9 @@ impl Codec {
             };
 
             // SAFETY: fi < num_fields <= MAX_FIELDS
-            unsafe { *msg.values.get_unchecked_mut(fi) = val; }
+            unsafe {
+                *msg.values.get_unchecked_mut(fi) = val;
+            }
         }
     }
 
@@ -744,9 +803,7 @@ impl Codec {
                     let res = gap - (self.ts_gap_ema >> 16).max(0);
                     let zz = residual::zigzag_enc(res);
 
-                    residual::adaptive_update(
-                        &mut self.ts_adapt_sum, &mut self.ts_adapt_count, zz,
-                    );
+                    residual::adaptive_update(&mut self.ts_adapt_sum, &mut self.ts_adapt_count, zz);
 
                     let gap_q16 = gap << 16;
                     self.ts_gap_ema += (gap_q16 - self.ts_gap_ema) >> 2;
@@ -772,7 +829,11 @@ impl Codec {
                     self.regime_counter += 1;
                     if self.regime_counter >= REGIME_WINDOW {
                         let avg = self.recent_abs_price_sum / REGIME_WINDOW;
-                        self.regime = if avg > 30 { Regime::Volatile } else { Regime::Calm };
+                        self.regime = if avg > 30 {
+                            Regime::Volatile
+                        } else {
+                            Regime::Calm
+                        };
                         self.recent_abs_price_sum = 0;
                         self.regime_counter = 0;
                     }
@@ -786,7 +847,11 @@ impl Codec {
                 FieldType::SequentialId => {
                     let inst_seq = self.instrument_state(instrument_id).last_seq_id;
                     let fs = &mut self.field_state[fi];
-                    let predicted = if inst_seq > 0 { inst_seq } else { fs.last_value };
+                    let predicted = if inst_seq > 0 {
+                        inst_seq
+                    } else {
+                        fs.last_value
+                    };
                     let delta = val.wrapping_sub(predicted) as i64;
                     let zz = residual::zigzag_enc(delta);
                     residual::adaptive_update(&mut fs.adapt_sum, &mut fs.adapt_count, zz);
@@ -927,7 +992,8 @@ mod tests {
                     let mut buf = [0u8; 64];
                     let len = enc.encode(&msg, &mut buf).unwrap();
                     let decoded = dec.decode(&buf[..len]).unwrap();
-                    if decoded.get(0) != ts || decoded.get(2) != (1_500_000 + (i * 7 % 2000)) as u64 {
+                    if decoded.get(0) != ts || decoded.get(2) != (1_500_000 + (i * 7 % 2000)) as u64
+                    {
                         errors += 1;
                     }
                 }
@@ -987,8 +1053,12 @@ mod tests {
         }
 
         // Seeded should be at least as good (likely better for early messages)
-        assert!(total_seeded <= total_cold,
-            "seeded ({}) should be <= cold ({})", total_seeded, total_cold);
+        assert!(
+            total_seeded <= total_cold,
+            "seeded ({}) should be <= cold ({})",
+            total_seeded,
+            total_cold
+        );
     }
 
     #[test]
@@ -1023,6 +1093,10 @@ mod tests {
         }
 
         let ratio = total_raw as f64 / total_comp as f64;
-        assert!(ratio > 1.5, "compression ratio should be > 1.5, got {:.2}", ratio);
+        assert!(
+            ratio > 1.5,
+            "compression ratio should be > 1.5, got {:.2}",
+            ratio
+        );
     }
 }

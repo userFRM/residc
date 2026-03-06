@@ -31,19 +31,6 @@ Measured on synthetic quote data (5 fields: timestamp, instrument, price, quanti
 
 Comparable performance. Rust uses hash-accelerated MFU lookup, direct-write BitWriter, and single-pass encode+commit.
 
-### vs SBE total delivery time
-
-SBE encodes in ~25ns (pointer cast, zero compression) but sends full-size messages. residc compresses ~3x, trading encode cycles for wire time.
-
-| Link | SBE (encode + wire) | residc (encode + wire + decode) | Winner |
-|------|--------------------|---------------------------------|--------|
-| 10 GbE, 19B msg | 25ns + 15ns = **40ns** | 49ns + 5ns + 42ns = **96ns** | SBE |
-| 1 GbE, 60B msg | 25ns + 480ns = **505ns** | 49ns + 160ns + 42ns = **251ns** | residc |
-| 100 Mbps WAN | 25ns + 4.8us = **4.8us** | 49ns + 1.6us + 42ns = **1.7us** | residc |
-| Multicast (N consumers) | N * 480ns wire | N * 160ns wire | residc |
-
-SBE wins in same-rack ultra-low-latency setups where bandwidth is free. residc wins everywhere bandwidth costs — WAN, cloud, data distribution, multicast, congested links.
-
 ## Usage
 
 ```rust

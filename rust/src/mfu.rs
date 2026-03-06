@@ -48,13 +48,7 @@ impl MfuTable {
             }
         }
         // Hash miss or collision — linear scan fallback
-        let len = self.len;
-        for i in 0..len {
-            if self.entries[i].id == id {
-                return Some(i);
-            }
-        }
-        None
+        self.entries[..self.len].iter().position(|e| e.id == id)
     }
 
     /// Record a use of `id`. If already in the table, increment its count
@@ -119,8 +113,7 @@ impl MfuTable {
     pub fn seed(&mut self, instruments: &[(u16, u32)]) {
         *self = Self::new();
         let n = instruments.len().min(MFU_SIZE);
-        for i in 0..n {
-            let (id, count) = instruments[i];
+        for (i, &(id, count)) in instruments[..n].iter().enumerate() {
             self.entries[i] = MfuEntry { id, count };
             let h = Self::hash_of(id);
             self.hash[h] = i as u16;

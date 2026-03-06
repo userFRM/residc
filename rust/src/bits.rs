@@ -11,7 +11,13 @@ pub struct BitWriter<'a> {
 impl<'a> BitWriter<'a> {
     #[inline]
     pub fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, accum: 0, bits_in_accum: 0, byte_pos: 0, overflow: false }
+        Self {
+            buf,
+            accum: 0,
+            bits_in_accum: 0,
+            byte_pos: 0,
+            overflow: false,
+        }
     }
 
     /// Write bits to the accumulator. Fast path for <= 57 bits (covers all
@@ -19,7 +25,9 @@ impl<'a> BitWriter<'a> {
     #[inline(always)]
     pub fn write(&mut self, value: u64, num_bits: u32) {
         debug_assert!(num_bits <= 64);
-        if self.overflow { return; }
+        if self.overflow {
+            return;
+        }
 
         if num_bits + self.bits_in_accum <= 64 {
             // Fast path: fits in accumulator.
@@ -82,7 +90,12 @@ pub struct BitReader<'a> {
 impl<'a> BitReader<'a> {
     #[inline]
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, accum: 0, bits_in_accum: 0, byte_pos: 0 }
+        Self {
+            data,
+            accum: 0,
+            bits_in_accum: 0,
+            byte_pos: 0,
+        }
     }
 
     /// Refill accumulator until we have at least `need` bits.
@@ -100,7 +113,9 @@ impl<'a> BitReader<'a> {
     #[inline(always)]
     pub fn read_bit(&mut self) -> u64 {
         self.refill(1);
-        if self.bits_in_accum == 0 { return 0; }
+        if self.bits_in_accum == 0 {
+            return 0;
+        }
         self.bits_in_accum -= 1;
         (self.accum >> self.bits_in_accum) & 1
     }
@@ -122,7 +137,11 @@ impl<'a> BitReader<'a> {
             (hi << second) | lo
         } else {
             self.bits_in_accum -= num_bits;
-            let mask = if num_bits >= 64 { u64::MAX } else { (1u64 << num_bits) - 1 };
+            let mask = if num_bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << num_bits) - 1
+            };
             (self.accum >> self.bits_in_accum) & mask
         }
     }

@@ -1,5 +1,5 @@
-use crate::bits::{BitWriter, BitReader};
 use crate::ADAPT_WINDOW;
+use crate::bits::{BitReader, BitWriter};
 
 /// Zigzag-encode a signed value to unsigned.
 /// Maps 0 -> 0, -1 -> 1, 1 -> 2, -2 -> 3, ...
@@ -93,7 +93,11 @@ pub fn adaptive_k(sum: u64, count: u32, k_min: u32, k_max: u32) -> u32 {
         return k_min;
     }
     let avg = sum / count as u64;
-    let bits = if avg == 0 { 0 } else { 64 - avg.leading_zeros() };
+    let bits = if avg == 0 {
+        0
+    } else {
+        64 - avg.leading_zeros()
+    };
     bits.clamp(k_min, k_max)
 }
 
@@ -140,6 +144,6 @@ mod tests {
     fn adaptive_k_basic() {
         assert_eq!(adaptive_k(0, 0, 3, 10), 3);
         assert_eq!(adaptive_k(1000, 10, 3, 10), 7); // avg=100, bits=7
-        assert_eq!(adaptive_k(1, 1, 5, 12), 5);     // avg=1, bits=1, clamped to 5
+        assert_eq!(adaptive_k(1, 1, 5, 12), 5); // avg=1, bits=1, clamped to 5
     }
 }

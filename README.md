@@ -32,65 +32,19 @@ ITCH 5.0      32.2 B    9.9 B     3.27:1      0     (8M real NASDAQ messages)
 
 Measured on 5-field synthetic quotes (100K messages). C uses `clock_gettime` best-of-10; Rust uses criterion statistical analysis (100 samples). Both compiled with `-march=native` / `target-cpu=native`.
 
-## Comparison to Alternatives
+## When to Use residc
 
-### Per-message codecs (apples to apples)
+residc fills the gap between zero-copy serializers (SBE, rkyv, Cap'n Proto) that don't compress and block compressors (LZ4, zstd) that can't work per-message:
 
-| Codec | Ratio (ITCH) | Encode | Decode | Per-msg | Approach |
-|-------|-------------|--------|--------|---------|----------|
-| **residc** | **3.27:1** | **49 ns** | **42 ns** | Yes | Prediction-residual |
-| SBE | 1.00:1 | ~25 ns | ~0 ns | Yes | Zero-copy struct overlay, no compression |
-| rkyv | 1.00:1 | ~10 ns | ~0 ns | Yes | Zero-copy archived structs, no compression |
-| Cap'n Proto | 1.00:1 | ~10 ns | ~0 ns | Yes | Zero-copy builder, no compression |
-| FlatBuffers | 1.00:1 | ~15 ns | ~0 ns | Yes | Zero-copy + offset tables, no compression |
-| FAST (FIX) | 2-4:1 | ~200 ns | ~200 ns | Yes | Template delta + stop-bit coding |
-| Protobuf | ~1.3:1 | ~100 ns | ~80 ns | Yes | Varint, no cross-message state |
-| LZ4 per-msg | 1.02:1 | ~50 ns | ~30 ns | Yes | Byte-sequence matching (too small) |
+| Codec | Ratio | Encode | Decode | Per-msg |
+|-------|-------|--------|--------|---------|
+| **residc** | **2-3:1** | **49 ns** | **42 ns** | Yes |
+| SBE / rkyv / Cap'n Proto | 1.0:1 | ~10-25 ns | ~0 ns | Yes |
+| Protobuf | ~1.3:1 | ~100 ns | ~80 ns | Yes |
+| LZ4 (per-msg) | ~1.0:1 | ~50 ns | ~30 ns | Yes |
+| zstd (64KB block) | ~2.5:1 | — | — | No |
 
-### Block codecs (different trade-off: no random access)
-
-| Codec | Ratio (ITCH) | Per-msg | Notes |
-|-------|-------------|---------|-------|
-| LZ4 block (64KB) | 1.80:1 | No | Needs buffering |
-| zstd block (64KB) | ~2.5:1 | No | Needs buffering |
-| zstd (dict) | ~2.8:1 | No | Requires pre-trained dictionary |
-
-### When to use what
-
-| Scenario | Best choice | Why |
-|----------|------------|-----|
-| Same-rack ultra-low-latency (FPGA, kernel bypass) | SBE / rkyv / Cap'n Proto | ~10-25ns encode, bandwidth is free |
-| WAN market data distribution | **residc** | 3x smaller = 3x more throughput, wire time dominates |
-| Cloud / multi-region feeds | **residc** | Bandwidth costs money, latency budget is microseconds |
-| Multicast to N consumers | **residc** | Compression paid once, wire savings multiplied N times |
-| Historical data storage | **residc** + block compressor | Per-message access + block-level ratio |
-| Cross-datacenter replication | **residc** | Every byte costs on leased lines |
-| Mobile / retail data delivery | **residc** | 2-3x compression, lower bandwidth costs |
-
-### Total delivery time: residc vs SBE
-
-SBE is faster to encode but sends larger messages. The real metric is **end-to-end**: encode + wire + decode.
-
-![Total Delivery Time: SBE vs residc](doc/img/delivery_time.svg)
-
-| Link | SBE total | residc total | Winner |
-|------|----------|-------------|--------|
-| 10 GbE, 19B msg | 25ns + 15ns = **40ns** | 49ns + 5ns + 42ns = **96ns** | SBE |
-| 1 GbE, 19B msg | 25ns + 152ns = **177ns** | 49ns + 51ns + 42ns = **142ns** | **residc** |
-| 1 GbE, 60B msg | 25ns + 480ns = **505ns** | 49ns + 160ns + 42ns = **251ns** | **residc** |
-| 100 Mbps WAN | 25ns + 4.8us = **4.8us** | 49ns + 1.6us + 42ns = **1.7us** | **residc** |
-| Multicast x10, 1GbE | 25ns + 10*480ns = **4.8us** | 49ns + 10*160ns + 42ns = **1.7us** | **residc** |
-
-**The crossover point is ~1 GbE.** Above that, SBE wins on encode speed. Below that, residc wins because 3x smaller messages travel 3x faster on the wire. For data distribution — where vendors serve thousands of consumers over WAN, cloud, or multicast — the compression pays for itself many times over.
-
-### vs FAST Protocol
-
-FAST (FIX Adapted for STreaming) was the FIX Trading Community's answer to this exact problem. It used template-based delta encoding with stop-bit coding. residc differs in:
-
-- **Prediction quality**: FAST uses simple delta. residc uses EMA (timestamps), MFU tables (instruments), per-instrument tracking (prices), regime detection (adaptive k). Better predictions = smaller residuals.
-- **Coding efficiency**: FAST uses stop-bit coding (7 useful bits per byte). residc uses tiered variable-width codes at bit granularity. More compact for small values.
-- **Simplicity**: residc is two C files (1,661 lines) or one Rust crate (1,194 lines excl. tests). FAST implementations are typically 10-50K lines.
-- **Status**: FAST is being deprecated. CME discontinued FAST feeds in 2023. SBE replaced it for low-latency; residc fills the compression niche that FAST left behind.
+**Use residc when bandwidth matters**: WAN distribution, cloud feeds, multicast to N consumers, cross-datacenter replication, mobile delivery. On links below ~1 GbE, the 2-3x smaller messages more than pay for the encode/decode cost. On 10 GbE same-rack, use SBE — bandwidth is free.
 
 ## Implementations
 

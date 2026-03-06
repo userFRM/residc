@@ -199,9 +199,7 @@ On the same ITCH data:
 
 ## 6. Related Work
 
-- **FAST Protocol** (FIX Adapted for STreaming): Template-based delta encoding for financial data, standardized by FIX Trading Community. Achieved 2-4:1 with stop-bit coding (7 useful bits per byte). Being phased out: CME discontinued FAST feeds in 2023, replaced by SBE for low-latency. residc fills the compression niche FAST left behind, with better predictions (EMA, MFU, regime detection vs simple delta) and tighter coding (bit-level vs byte-level).
-
-- **SBE** (Simple Binary Encoding): Fixed-layout binary encoding with zero compression. ~25ns encode via pointer cast. Industry standard for order entry at CME, Euronext, LSE. Optimal when bandwidth is unlimited (same-rack colo). residc complements SBE for bandwidth-constrained paths where 3x compression reduces total delivery time.
+- **SBE** (Simple Binary Encoding): Fixed-layout binary encoding with zero compression. ~25ns encode via pointer cast. Industry standard for order entry at CME, Euronext, LSE. Optimal when bandwidth is unlimited (same-rack colo). residc complements SBE for bandwidth-constrained paths where 2-3x compression reduces total delivery time.
 
 - **rkyv / Cap'n Proto / FlatBuffers**: Zero-copy serialization formats. ~10-15ns encode, ~0ns deserialize (pointer cast). No compression. rkyv is the Rust-native option with the smallest overhead. Same trade-off as SBE: fastest possible encode, no size reduction. See [rust_serialization_benchmark](https://github.com/djkoloski/rust_serialization_benchmark) for comparative numbers.
 
@@ -215,9 +213,9 @@ On the same ITCH data:
 
 ## 7. Limitations
 
-- **Higher encode latency than SBE**: SBE achieves ~25ns through zero-copy pointer cast. residc is ~51ns (C) / ~52ns (Rust) due to prediction + bit-level coding. On 10GbE same-rack links where bandwidth is free, SBE delivers lower total latency.
+- **Higher encode latency than SBE**: SBE achieves ~25ns through zero-copy pointer cast. residc is ~51ns (C) / ~49ns (Rust) due to prediction + bit-level coding. On 10GbE same-rack links where bandwidth is free, SBE delivers lower total latency.
 
-- **State dependency**: Messages must be decoded in order from a known state. Loss of a single message desynchronizes encoder and decoder. The `residc_snapshot()` / `residc_restore()` API enables checkpoint-based recovery: snapshot periodically, restore on gap detection, replay from the checkpoint. This is inherent to any streaming prediction approach (same limitation as FAST Protocol).
+- **State dependency**: Messages must be decoded in order from a known state. Loss of a single message desynchronizes encoder and decoder. The `residc_snapshot()` / `residc_restore()` API enables checkpoint-based recovery: snapshot periodically, restore on gap detection, replay from the checkpoint. This is inherent to any streaming prediction approach.
 
 - **Memory footprint**: ~330KB per codec instance (16,384 instrument state slots + MFU table + field state). Configurable via `MAX_INSTRUMENTS` constant.
 
