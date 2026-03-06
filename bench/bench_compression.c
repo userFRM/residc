@@ -1,7 +1,7 @@
 /*
  * bench_compression.c — Compression ratio benchmark across message types
  *
- * Tests residc on realistic synthetic data for common financial message types:
+ * Tests residc on synthetic and realistic data for common financial message types:
  *   - Quotes (5 fields): bid/ask updates
  *   - Trades (8 fields): execution reports
  *   - Orders (10 fields): new order single
@@ -242,6 +242,207 @@ static void gen_book_updates(BookUpdate *msgs, int n) {
 }
 
 /* ================================================================
+ * Realistic data generators
+ *
+ * These model real market data patterns:
+ *   - Zipf instrument distribution (top 5 get ~60% of traffic)
+ *   - Price random walks (small tick increments, occasional jumps)
+ *   - Quantity clustering (60% round lots, 30% x10, 10% odd)
+ *   - Timestamp bursts (clusters of fast messages with gaps)
+ *   - Instrument locality (consecutive msgs for same stock)
+ * ================================================================ */
+
+/* Zipf-like instrument selection: top instruments get most traffic */
+static uint16_t zipf_instrument(int n_instruments) {
+    uint32_t r = rng_range(0, 99);
+    if (r < 60) return (uint16_t)rng_range(0, 4);           /* top 5: 60% */
+    if (r < 85) return (uint16_t)rng_range(5, 14);          /* next 10: 25% */
+    return (uint16_t)rng_range(15, (uint32_t)(n_instruments - 1)); /* rest: 15% */
+}
+
+/* Instrument with locality: 30% same-as-last, 10% same-as-2-back */
+static uint16_t instrument_with_locality(uint16_t last, uint16_t second_last,
+                                         int n_instruments, int msg_count) {
+    if (msg_count > 0) {
+        uint32_t r = rng_range(0, 99);
+        if (r < 30) return last;          /* 30% repeat */
+        if (r < 40) return second_last;   /* 10% alternation */
+    }
+    return zipf_instrument(n_instruments);
+}
+
+/* Realistic quantity: 60% round lots, 30% x10, 10% odd */
+static uint32_t realistic_quantity(void) {
+    uint32_t r = rng_range(0, 99);
+    if (r < 60) {
+        /* Round lots: heavily clustered at 100, 200, 500, 1000 */
+        uint32_t r2 = rng_range(0, 99);
+        if (r2 < 40) return 100;
+        if (r2 < 60) return 200;
+        if (r2 < 75) return 500;
+        if (r2 < 85) return 1000;
+        return rng_range(1, 50) * 100;
+    }
+    if (r < 90) {
+        /* Multiples of 10 */
+        return rng_range(1, 200) * 10;
+    }
+    /* Odd lots */
+    return rng_range(1, 500);
+}
+
+/* Bursty timestamp: 90% in-burst (50-200ns gap), 10% between bursts (1-50us) */
+static uint64_t bursty_timestamp(uint64_t last_ts) {
+    uint32_t r = rng_range(0, 99);
+    if (r < 90) {
+        return last_ts + 50 + rng_range(0, 150);     /* in-burst: 50-200ns */
+    }
+    return last_ts + 1000 + rng_range(0, 49000);      /* gap: 1-50us */
+}
+
+static void gen_quotes_realistic(Quote *msgs, int n) {
+    uint64_t ts = 34200000000000ULL;
+    /* Per-instrument price state (random walk) */
+    uint32_t prices[50];
+    for (int i = 0; i < 50; i++)
+        prices[i] = 1000000 + rng_range(0, 2000000); /* $100-$300 */
+
+    uint16_t last_inst = 0, second_last_inst = 0;
+    for (int i = 0; i < n; i++) {
+        ts = bursty_timestamp(ts);
+        uint16_t inst = instrument_with_locality(last_inst, second_last_inst, 50, i);
+
+        /* Random walk: +/- 1-3 ticks (1 tick = 100 = $0.01) */
+        int32_t delta = (int32_t)rng_range(0, 6) - 3; /* -3 to +3 */
+        /* Occasional large move (1% chance) */
+        if (rng_range(0, 99) == 0)
+            delta = (int32_t)rng_range(0, 200) - 100;  /* -100 to +100 ticks */
+        prices[inst] = (uint32_t)((int64_t)prices[inst] + delta * 100);
+
+        msgs[i].timestamp = ts;
+        msgs[i].instrument_id = inst;
+        msgs[i].price = prices[inst];
+        msgs[i].quantity = realistic_quantity();
+        msgs[i].side = (uint8_t)(rng_next() & 1);
+
+        second_last_inst = last_inst;
+        last_inst = inst;
+    }
+}
+
+static void gen_trades_realistic(Trade *msgs, int n) {
+    uint64_t ts = 34200000000000ULL;
+    uint64_t tid = 1000000;
+    uint32_t firms[] = {
+        1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010,
+        2001, 2002, 2003, 2004, 2005, 3001, 3002, 3003, 4001, 5001
+    };
+    uint32_t prices[50];
+    for (int i = 0; i < 50; i++)
+        prices[i] = 1000000 + rng_range(0, 2000000);
+
+    uint16_t last_inst = 0, second_last_inst = 0;
+    for (int i = 0; i < n; i++) {
+        ts = bursty_timestamp(ts);
+        /* Trades: small monotonic increments, 80% +1, 15% +2, 5% +3 */
+        uint32_t r = rng_range(0, 99);
+        tid += (r < 80) ? 1 : (r < 95) ? 2 : 3;
+
+        uint16_t inst = instrument_with_locality(last_inst, second_last_inst, 50, i);
+
+        int32_t delta = (int32_t)rng_range(0, 6) - 3;
+        if (rng_range(0, 99) == 0)
+            delta = (int32_t)rng_range(0, 200) - 100;
+        prices[inst] = (uint32_t)((int64_t)prices[inst] + delta * 100);
+
+        msgs[i].timestamp = ts;
+        msgs[i].instrument_id = inst;
+        msgs[i].price = prices[inst];
+        msgs[i].quantity = realistic_quantity();
+        msgs[i].trade_id = tid;
+        /* Zipf firm distribution */
+        r = rng_range(0, 99);
+        int bi = (r < 60) ? (int)rng_range(0, 4) : (int)rng_range(5, 19);
+        r = rng_range(0, 99);
+        int si = (r < 60) ? (int)rng_range(0, 4) : (int)rng_range(5, 19);
+        msgs[i].buyer_id = firms[bi];
+        msgs[i].seller_id = firms[si];
+        msgs[i].aggressor_side = (uint8_t)(rng_next() & 1);
+
+        second_last_inst = last_inst;
+        last_inst = inst;
+    }
+}
+
+static void gen_orders_realistic(Order *msgs, int n) {
+    uint64_t ts = 34200000000000ULL;
+    uint64_t oid = 5000000;
+    uint32_t accounts[] = { 100, 101, 102, 103, 104, 200, 201, 300, 400, 500 };
+    uint32_t prices[50];
+    for (int i = 0; i < 50; i++)
+        prices[i] = 1000000 + rng_range(0, 2000000);
+
+    uint16_t last_inst = 0, second_last_inst = 0;
+    for (int i = 0; i < n; i++) {
+        ts = bursty_timestamp(ts);
+        oid += 1;
+        uint16_t inst = instrument_with_locality(last_inst, second_last_inst, 50, i);
+
+        int32_t delta = (int32_t)rng_range(0, 6) - 3;
+        if (rng_range(0, 99) == 0)
+            delta = (int32_t)rng_range(0, 200) - 100;
+        prices[inst] = (uint32_t)((int64_t)prices[inst] + delta * 100);
+
+        msgs[i].timestamp = ts;
+        msgs[i].instrument_id = inst;
+        msgs[i].price = prices[inst];
+        msgs[i].quantity = realistic_quantity();
+        msgs[i].order_id = oid;
+        /* Top 3 accounts: 70% */
+        uint32_t r = rng_range(0, 99);
+        int idx = (r < 70) ? (int)rng_range(0, 2) : (int)rng_range(3, 9);
+        msgs[i].account_id = accounts[idx];
+        msgs[i].side = (uint8_t)(rng_next() & 1);
+        r = rng_range(0, 99);
+        msgs[i].order_type = (r < 80) ? 0 : (r < 95) ? 1 : (uint8_t)rng_range(2, 3);
+        r = rng_range(0, 99);
+        msgs[i].time_in_force = (r < 60) ? 0 : (r < 85) ? 1 : (r < 95) ? 2 : 3;
+        msgs[i].flags = 0;
+
+        second_last_inst = last_inst;
+        last_inst = inst;
+    }
+}
+
+static void gen_book_updates_realistic(BookUpdate *msgs, int n) {
+    uint64_t ts = 34200000000000ULL;
+    uint32_t prices[50];
+    for (int i = 0; i < 50; i++)
+        prices[i] = 1000000 + rng_range(0, 2000000);
+
+    uint16_t last_inst = 0, second_last_inst = 0;
+    for (int i = 0; i < n; i++) {
+        ts = bursty_timestamp(ts);
+        uint16_t inst = instrument_with_locality(last_inst, second_last_inst, 50, i);
+
+        int32_t delta = (int32_t)rng_range(0, 4) - 2; /* tighter spread for book */
+        prices[inst] = (uint32_t)((int64_t)prices[inst] + delta * 100);
+
+        msgs[i].timestamp = ts;
+        msgs[i].instrument_id = inst;
+        msgs[i].price = prices[inst];
+        msgs[i].quantity = realistic_quantity();
+        msgs[i].side = (uint8_t)(rng_next() & 1);
+        uint32_t r = rng_range(0, 99);
+        msgs[i].action = (r < 30) ? 0 : (r < 80) ? 1 : 2;
+        msgs[i].level = (uint8_t)rng_range(0, 9);
+
+        second_last_inst = last_inst;
+        last_inst = inst;
+    }
+}
+
+/* ================================================================
  * Benchmark runner
  * ================================================================ */
 
@@ -334,48 +535,16 @@ static void bench_schema(
     free(bufs);
 }
 
-int main(void)
+static void print_results(const char *label __attribute__((unused)),
+                          BenchResult *results, int n_types,
+                          int *total_errors)
 {
-    rng_state = 12345678901ULL;
-
-    /* Allocate message arrays */
-    Quote *quotes = malloc(N_MSGS * sizeof(Quote));
-    Trade *trades = malloc(N_MSGS * sizeof(Trade));
-    Order *orders = malloc(N_MSGS * sizeof(Order));
-    BookUpdate *books = malloc(N_MSGS * sizeof(BookUpdate));
-
-    /* Generate data */
-    gen_quotes(quotes, N_MSGS);
-    gen_trades(trades, N_MSGS);
-    gen_orders(orders, N_MSGS);
-    gen_book_updates(books, N_MSGS);
-
-    /* Run benchmarks */
-    BenchResult results[4];
-
-    bench_schema(&quote_schema, quotes, N_MSGS,
-        "Quote", "bid/ask updates (5 fields)", &results[0]);
-
-    bench_schema(&trade_schema, trades, N_MSGS,
-        "Trade", "execution reports (8 fields)", &results[1]);
-
-    bench_schema(&order_schema, orders, N_MSGS,
-        "Order", "new order single (10 fields)", &results[2]);
-
-    bench_schema(&book_schema, books, N_MSGS,
-        "Book Update", "L2 depth incremental (7 fields)", &results[3]);
-
-    /* Print results */
-    printf("residc compression benchmark (%d messages per type, best of %d iterations)\n", N_MSGS, N_ITERS);
-    printf("================================================================================\n\n");
-
     printf("%-14s  %6s  %10s  %7s  %7s  %7s  %6s\n",
            "Message", "Fields", "Raw", "Compr.", "Ratio", "Enc", "Dec");
     printf("%-14s  %6s  %10s  %7s  %7s  %7s  %6s\n",
            "--------------", "------", "----------", "-------", "-------", "-------", "------");
 
-    int total_errors = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < n_types; i++) {
         BenchResult *r = &results[i];
         double avg_compressed = (double)r->total_compressed / N_MSGS;
         double ratio = (double)r->raw_size / avg_compressed;
@@ -384,8 +553,59 @@ int main(void)
                r->best_encode_ns, r->best_decode_ns);
         if (r->errors > 0) printf("  [%d ERRORS]", r->errors);
         printf("\n");
-        total_errors += r->errors;
+        *total_errors += r->errors;
     }
+}
+
+int main(void)
+{
+    Quote *quotes = calloc(N_MSGS, sizeof(Quote));
+    Trade *trades = calloc(N_MSGS, sizeof(Trade));
+    Order *orders = calloc(N_MSGS, sizeof(Order));
+    BookUpdate *books = calloc(N_MSGS, sizeof(BookUpdate));
+    BenchResult results[4];
+    int total_errors = 0;
+
+    printf("residc compression benchmark (%d messages per type, best of %d iterations)\n", N_MSGS, N_ITERS);
+    printf("================================================================================\n");
+
+    /* ---- Synthetic (uniform random) data ---- */
+    rng_state = 12345678901ULL;
+    gen_quotes(quotes, N_MSGS);
+    gen_trades(trades, N_MSGS);
+    gen_orders(orders, N_MSGS);
+    gen_book_updates(books, N_MSGS);
+
+    bench_schema(&quote_schema, quotes, N_MSGS,
+        "Quote", "bid/ask updates (5 fields)", &results[0]);
+    bench_schema(&trade_schema, trades, N_MSGS,
+        "Trade", "execution reports (8 fields)", &results[1]);
+    bench_schema(&order_schema, orders, N_MSGS,
+        "Order", "new order single (10 fields)", &results[2]);
+    bench_schema(&book_schema, books, N_MSGS,
+        "Book Update", "L2 depth incremental (7 fields)", &results[3]);
+
+    printf("\n--- SYNTHETIC data (uniform random instruments/prices/quantities) ---\n\n");
+    print_results("Synthetic", results, 4, &total_errors);
+
+    /* ---- Realistic market data ---- */
+    rng_state = 98765432109ULL;  /* different seed for realistic data */
+    gen_quotes_realistic(quotes, N_MSGS);
+    gen_trades_realistic(trades, N_MSGS);
+    gen_orders_realistic(orders, N_MSGS);
+    gen_book_updates_realistic(books, N_MSGS);
+
+    bench_schema(&quote_schema, quotes, N_MSGS,
+        "Quote", "bid/ask updates (5 fields)", &results[0]);
+    bench_schema(&trade_schema, trades, N_MSGS,
+        "Trade", "execution reports (8 fields)", &results[1]);
+    bench_schema(&order_schema, orders, N_MSGS,
+        "Order", "new order single (10 fields)", &results[2]);
+    bench_schema(&book_schema, books, N_MSGS,
+        "Book Update", "L2 depth incremental (7 fields)", &results[3]);
+
+    printf("\n--- REALISTIC data (Zipf instruments, price walks, qty clustering, bursty ts) ---\n\n");
+    print_results("Realistic", results, 4, &total_errors);
 
     printf("\nAll roundtrips: %s\n", total_errors == 0 ? "PASS (0 errors)" : "FAIL");
 

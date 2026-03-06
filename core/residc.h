@@ -123,6 +123,10 @@ extern "C" {
 /* Frame markers */
 #define RESIDC_FRAME_LITERAL    0xFF
 
+/* Residual coder selection */
+#define RESIDC_CODER_TIERED     0   /* Default: 5-tier variable-width code */
+#define RESIDC_CODER_EXPGOLOMB  1   /* Exp-Golomb: better compression, slightly slower decode */
+
 /* ================================================================
  * Field Types
  *
@@ -299,6 +303,12 @@ typedef struct {
     uint16_t           num_entries;
     uint16_t           hash[256];
     uint16_t           chain[RESIDC_MFU_SIZE];
+    /* Frequency rank mapping for variable-length index encoding.
+     * rank_to_idx[r] = physical index of the entry with rank r (0 = most frequent).
+     * idx_to_rank[i] = rank of physical index i.
+     * Rebuilt at init, seed, and every decay cycle. */
+    uint8_t            rank_to_idx[RESIDC_MFU_SIZE];
+    uint8_t            idx_to_rank[RESIDC_MFU_SIZE];
 } residc_mfu_table_t;
 
 /* Per-field adaptive state */
@@ -334,6 +344,12 @@ typedef struct {
     uint32_t regime_counter;
     uint32_t recent_abs_price_sum;
 
+    /* Adaptive k for price and quantity */
+    uint64_t price_adapt_sum;
+    uint32_t price_adapt_count;
+    uint64_t qty_adapt_sum;
+    uint32_t qty_adapt_count;
+
     /* Per-field state (for ENUM, CATEGORICAL, SEQUENTIAL_ID) */
     residc_field_state_t field_state[RESIDC_MAX_FIELDS];
 
@@ -342,6 +358,9 @@ typedef struct {
 
     /* Last message type (for multi-schema) */
     uint8_t last_msg_type_index;
+
+    /* Residual coder: RESIDC_CODER_TIERED (default) or RESIDC_CODER_EXPGOLOMB */
+    uint8_t residual_coder;
 } residc_state_t;
 
 /* ================================================================
@@ -460,9 +479,9 @@ static inline int64_t residc_zigzag_dec(uint64_t u)
  *
  * Encodes a signed residual using a 5-tier variable-width code:
  *   Tier 0: 0  + k bits          (values < 2^k)
- *   Tier 1: 10 + (k+6) bits      (values < 2^(k+6))
- *   Tier 2: 110 + (k+12) bits    (values < 2^(k+12))
- *   Tier 3: 1110 + (k+20) bits   (values < 2^(k+20))
+ *   Tier 1: 10 + (k+2) bits      (values < 2^(k+2))
+ *   Tier 2: 110 + (k+5) bits     (values < 2^(k+5))
+ *   Tier 3: 1110 + (k+10) bits   (values < 2^(k+10))
  *   Tier 4: 1111 + 64 raw bits   (any value)
  *
  * The k parameter controls the boundary between tiers.
@@ -471,6 +490,17 @@ static inline int64_t residc_zigzag_dec(uint64_t u)
  */
 void    residc_encode_residual(residc_bitwriter_t *bw, int64_t value, int k);
 int64_t residc_decode_residual(residc_bitreader_t *br, int k);
+
+/* --- Exp-Golomb residual coding --- */
+void    residc_encode_residual_expg(residc_bitwriter_t *bw, int64_t value, int k);
+int64_t residc_decode_residual_expg(residc_bitreader_t *br, int k);
+
+/*
+ * Set the residual coder for a codec state.
+ * Must be called identically on encoder and decoder.
+ * @param coder  RESIDC_CODER_TIERED or RESIDC_CODER_EXPGOLOMB
+ */
+void    residc_set_coder(residc_state_t *state, int coder);
 
 /*
  * Adaptive k computation (JPEG-LS style).

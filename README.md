@@ -129,18 +129,29 @@ assert values == [34200000000000, 42, 1500250, 100, 0]
 
 ## Benchmarks
 
-100K synthetic messages per type, gcc -O2 `-march=native`, best of 10 iterations. Fully reproducible:
+100K messages per type, gcc -O2 `-march=native`, best of 10 iterations. Fully reproducible:
 
 ```bash
-cc -O2 -march=native -o bench bench/bench_compression.c core/residc.c -Icore && ./bench
+cc -O2 -march=native -o bench_compression bench/bench_compression.c core/residc.c -Icore && ./bench_compression
 ```
+
+#### Synthetic data (uniform random instruments/prices)
 
 | Message | Fields | Raw | Compressed | Ratio | Encode | Decode |
 |---------|--------|-----|------------|-------|--------|--------|
-| **Quote** (bid/ask update) | 5 | 19 B | 7.9 B | **2.41:1** | 63 ns | 59 ns |
-| **Trade** (execution report) | 8 | 35 B | 17.2 B | **2.04:1** | 105 ns | 96 ns |
-| **Order** (new order single) | 10 | 34 B | 14.3 B | **2.38:1** | 118 ns | 110 ns |
-| **Book Update** (L2 depth) | 7 | 21 B | 9.5 B | **2.21:1** | 79 ns | 73 ns |
+| **Quote** (bid/ask update) | 5 | 19 B | 7.8 B | **2.43:1** | 51 ns | 45 ns |
+| **Trade** (execution report) | 8 | 35 B | 17.0 B | **2.06:1** | 70 ns | 64 ns |
+| **Order** (new order single) | 10 | 34 B | 14.0 B | **2.43:1** | 85 ns | 68 ns |
+| **Book Update** (L2 depth) | 7 | 21 B | 9.4 B | **2.24:1** | 65 ns | 52 ns |
+
+#### Realistic data (Zipf instruments, price walks, quantity clustering, bursty timestamps)
+
+| Message | Fields | Raw | Compressed | Ratio | Encode | Decode |
+|---------|--------|-----|------------|-------|--------|--------|
+| **Quote** | 5 | 19 B | 7.1 B | **2.68:1** | 58 ns | 48 ns |
+| **Trade** | 8 | 35 B | 15.7 B | **2.23:1** | 78 ns | 66 ns |
+| **Order** | 10 | 34 B | 12.8 B | **2.66:1** | 89 ns | 70 ns |
+| **Book Update** | 7 | 21 B | 8.8 B | **2.40:1** | 69 ns | 58 ns |
 
 Zero roundtrip errors across all message types. SDK bindings (Rust, Python) add FFI overhead (~40-70ns).
 
@@ -148,7 +159,7 @@ Zero roundtrip errors across all message types. SDK bindings (Rust, Python) add 
 
 | Codec | Ratio | Per-msg encode | Per-msg decode | Per-message? |
 |-------|-------|----------------|----------------|:------------:|
-| **residc** | **2-2.4:1** | **63 ns** | **59 ns** | Yes |
+| **residc** | **2.2-2.7:1** | **51-89 ns** | **45-70 ns** | Yes |
 | SBE / Cap'n Proto | 1.0:1 | ~10-25 ns | ~0 ns | Yes |
 | Protobuf | ~1.3:1 | ~100 ns | ~80 ns | Yes |
 | LZ4 (per-msg) | ~1.0:1 | ~50 ns | ~30 ns | Yes |

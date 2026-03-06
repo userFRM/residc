@@ -53,14 +53,15 @@ The `k` parameter is regime-dependent:
 | Quantity | 4 | 7 |
 | SequentialId | 3 | 5 |
 
-## Adaptive k (Timestamp, SequentialId)
+## Adaptive k (Timestamp, Price, Quantity, SequentialId)
 
-For Timestamp and SequentialId fields, `k` is further refined by an adaptive algorithm:
+For Timestamp, Price, Quantity, and SequentialId fields, `k` is refined by an adaptive algorithm:
 
 1. Maintain a running `sum` and `count` of recent zigzag-encoded residuals.
-2. Compute `avg = sum / count`.
-3. `k = floor(log2(avg))`, clamped to `[k_min, k_max]` where `k_min` is the regime-dependent k and `k_max = k_min + 10`.
-4. After each residual, update: `sum += zz; count++`. When `count >= 8`, halve both (`sum >>= 1; count >>= 1`).
+2. Compute `k = floor(log2(sum)) - floor(log2(count))`, clamped to `[k_min, k_max]` where `k_min` is the regime-dependent k and `k_max = k_min + 10`.
+3. After each residual, update: `sum += zz; count++`. When `count >= 8`, halve both (`sum >>= 1; count >>= 1`).
+
+For Price, the adaptive state tracks the coded residual (penny-normalized when applicable). For Quantity, adaptive state is updated only when the residual is non-zero (the "same as predicted" fast path does not update adaptive state).
 
 ## Per-Field Encoding
 
@@ -76,7 +77,11 @@ For Timestamp and SequentialId fields, `k` is further refined by an adaptive alg
 
 1. If same as last instrument and `msg_count > 0`: write `0` (1 bit).
 2. Else write `1` (1 bit), then:
-   - If found in MFU table at index `idx`: write `0` (1 bit) + `idx` (8 bits).
+   - If found in MFU table at index `idx`: convert `idx` to frequency rank, then write `0` (1 bit) + variable-length rank encoding:
+     - Rank 0-3: `0` (1 bit) + rank (2 bits) = 3 bits total
+     - Rank 4-15: `10` (2 bits) + (rank-4) (4 bits) = 6 bits total
+     - Rank 16-63: `110` (3 bits) + (rank-16) (6 bits) = 9 bits total
+     - Rank 64-255: `111` (3 bits) + rank (8 bits) = 11 bits total
    - Else: write `1` (1 bit) + raw instrument ID (14 bits).
 
 ### Price
@@ -142,7 +147,13 @@ The MFU (Most Frequently Used) table tracks the top 256 instruments by frequency
 - **Structure**: 256 entries, each with `(instrument_id, count)`. Hash table with separate chaining for O(1) lookup.
 - **Update**: On each instrument occurrence, increment count. If table is full and instrument is new, replace the entry with minimum count.
 - **Decay**: Every 10,000 messages, all counts are halved (`count >>= 1`) to adapt to changing distributions.
-- **Encoding**: MFU index is 8 bits (`RESIDC_MFU_INDEX_BITS`). A non-MFU instrument uses the 14-bit raw escape code.
+- **Rank mapping**: Entries are ranked by descending frequency. Ranks are rebuilt at init, seed, and every decay cycle. Both encoder and decoder maintain identical rank mappings.
+- **Encoding**: MFU index is encoded as a variable-length rank code:
+  - Rank 0-3: prefix `0` + 2-bit rank = 3 bits total
+  - Rank 4-15: prefix `10` + 4-bit offset (rank-4) = 6 bits total
+  - Rank 16-63: prefix `110` + 6-bit offset (rank-16) = 9 bits total
+  - Rank 64-255: prefix `111` + 8-bit offset (rank-64) = 11 bits total
+- A non-MFU instrument uses the 14-bit raw escape code.
 
 ## State Evolution
 
