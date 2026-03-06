@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="'Helvetica Neue', Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 550" font-family="'Helvetica Neue', Arial, sans-serif">
   <defs>
     <style>
       .title { font-size: 18px; font-weight: 600; fill: #1a1a2e; }
@@ -13,14 +13,22 @@
   </defs>
 
   <!-- Background -->
-  <rect width="800" height="500" fill="#fafbfc" rx="8"/>
+  <rect width="800" height="550" fill="#fafbfc" rx="8"/>
 
   <!-- Title -->
-  <text x="400" y="32" text-anchor="middle" class="title">Total Delivery Time: SBE vs residc</text>
-  <text x="400" y="50" text-anchor="middle" class="subtitle">encode + wire transmission + decode (lower is better)</text>
+  <text x="400" y="30" text-anchor="middle" class="title">Total Delivery Time: SBE vs residc</text>
+  <text x="400" y="48" text-anchor="middle" class="subtitle">encode + wire transmission + decode (lower is better)</text>
+
+  <!-- Legend -->
+  <g transform="translate(170, 62)">
+    <rect x="0" y="0" width="12" height="12" fill="#e74c3c" rx="2"/>
+    <text x="18" y="11" class="legend-text">SBE (no compression, ~25 ns encode)</text>
+    <rect x="300" y="0" width="12" height="12" fill="#2980b9" rx="2"/>
+    <text x="318" y="11" class="legend-text">residc (3x compression, ~52 ns encode + 39 ns decode)</text>
+  </g>
 
   <!-- Chart area -->
-  <g transform="translate(140, 70)">
+  <g transform="translate(140, 95)">
     <!-- Y axis labels (scenarios) -->
     <text x="-10" y="38" text-anchor="end" class="axis-label">10 GbE (19B msg)</text>
     <text x="-10" y="108" text-anchor="end" class="axis-label">1 GbE (19B msg)</text>
@@ -38,79 +46,71 @@
     <line x1="480" y1="0" x2="480" y2="410" stroke="#eee" stroke-width="0.5"/>
     <line x1="600" y1="0" x2="600" y2="410" stroke="#eee" stroke-width="0.5"/>
 
-    <!-- X axis tick labels (nanoseconds) -->
-    <text x="0" y="425" text-anchor="middle" class="tick-label">0</text>
-    <text x="120" y="425" text-anchor="middle" class="tick-label">1 us</text>
-    <text x="240" y="425" text-anchor="middle" class="tick-label">2 us</text>
-    <text x="360" y="425" text-anchor="middle" class="tick-label">3 us</text>
-    <text x="480" y="425" text-anchor="middle" class="tick-label">4 us</text>
-    <text x="600" y="425" text-anchor="middle" class="tick-label">5 us</text>
+    <!-- X axis tick labels -->
+    <text x="0" y="430" text-anchor="middle" class="tick-label">0</text>
+    <text x="120" y="430" text-anchor="middle" class="tick-label">1 us</text>
+    <text x="240" y="430" text-anchor="middle" class="tick-label">2 us</text>
+    <text x="360" y="430" text-anchor="middle" class="tick-label">3 us</text>
+    <text x="480" y="430" text-anchor="middle" class="tick-label">4 us</text>
+    <text x="600" y="430" text-anchor="middle" class="tick-label">5 us</text>
 
     <!-- Scale: 600px = 5000ns, 1px = 8.33ns -->
 
     <!-- === 10 GbE (19B) === -->
     <!-- SBE: 25 + 15 = 40ns = 4.8px -->
     <rect x="0" y="22" width="4.8" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 50 + 5 + 46 = 101ns = 12.1px -->
-    <rect x="0" y="38" width="12.1" height="14" fill="#2980b9" rx="2"/>
+    <!-- residc: 52 + 5 + 39 = 96ns = 11.5px -->
+    <rect x="0" y="38" width="11.5" height="14" fill="#2980b9" rx="2"/>
     <text x="18" y="33" class="bar-label-dark">40 ns</text>
-    <text x="26" y="49" class="bar-label-dark">101 ns</text>
+    <text x="25" y="49" class="bar-label-dark">96 ns</text>
     <text x="80" y="41" class="winner" fill="#e74c3c">SBE wins</text>
 
     <!-- === 1 GbE (19B) === -->
     <!-- SBE: 25 + 152 = 177ns = 21.2px -->
     <rect x="0" y="92" width="21.2" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 50 + 51 + 46 = 147ns = 17.6px -->
-    <rect x="0" y="108" width="17.6" height="14" fill="#2980b9" rx="2"/>
+    <!-- residc: 52 + 51 + 39 = 142ns = 17.0px -->
+    <rect x="0" y="108" width="17.0" height="14" fill="#2980b9" rx="2"/>
     <text x="35" y="103" class="bar-label-dark">177 ns</text>
-    <text x="31" y="119" class="bar-label-dark">147 ns</text>
+    <text x="31" y="119" class="bar-label-dark">142 ns</text>
     <text x="90" y="111" class="winner" fill="#2980b9">residc wins</text>
 
     <!-- === 1 GbE (60B) === -->
     <!-- SBE: 25 + 480 = 505ns = 60.6px -->
     <rect x="0" y="162" width="60.6" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 50 + 160 + 46 = 256ns = 30.7px -->
-    <rect x="0" y="178" width="30.7" height="14" fill="#2980b9" rx="2"/>
+    <!-- residc: 52 + 160 + 39 = 251ns = 30.1px -->
+    <rect x="0" y="178" width="30.1" height="14" fill="#2980b9" rx="2"/>
     <text x="74" y="173" class="bar-label-dark">505 ns</text>
-    <text x="44" y="189" class="bar-label-dark">256 ns</text>
+    <text x="44" y="189" class="bar-label-dark">251 ns</text>
     <text x="120" y="181" class="winner" fill="#2980b9">residc 2x faster</text>
 
     <!-- === 100 Mbps WAN === -->
     <!-- SBE: 25 + 4800 = 4825ns = 579px -->
     <rect x="0" y="232" width="579" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 50 + 1600 + 46 = 1696ns = 203.5px -->
-    <rect x="0" y="248" width="203.5" height="14" fill="#2980b9" rx="2"/>
+    <!-- residc: 52 + 1600 + 39 = 1691ns = 202.9px -->
+    <rect x="0" y="248" width="202.9" height="14" fill="#2980b9" rx="2"/>
     <text x="540" y="243" class="bar-label">4.8 us</text>
     <text x="170" y="259" class="bar-label-dark">1.7 us</text>
-    <text x="270" y="251" class="winner" fill="#2980b9">residc 2.8x faster</text>
+    <text x="270" y="251" class="winner" fill="#2980b9">residc 2.9x faster</text>
 
     <!-- === Multicast x10 (1GbE, 60B) === -->
     <!-- SBE: 25 + 10*480 = 4825ns = 579px -->
     <rect x="0" y="302" width="579" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 50 + 10*160 + 46 = 1696ns = 203.5px -->
-    <rect x="0" y="318" width="203.5" height="14" fill="#2980b9" rx="2"/>
+    <!-- residc: 52 + 10*160 + 39 = 1691ns = 202.9px -->
+    <rect x="0" y="318" width="202.9" height="14" fill="#2980b9" rx="2"/>
     <text x="540" y="313" class="bar-label">4.8 us</text>
     <text x="170" y="329" class="bar-label-dark">1.7 us</text>
-    <text x="270" y="321" class="winner" fill="#2980b9">residc 2.8x faster</text>
+    <text x="270" y="321" class="winner" fill="#2980b9">residc 2.9x faster</text>
 
     <!-- === 10 Mbps (mobile/retail) === -->
     <!-- SBE: 25 + 48000 = 48025ns, capped at 600px -->
     <rect x="0" y="372" width="600" height="14" fill="#e74c3c" rx="2"/>
-    <!-- residc: 50 + 16000 + 46 = 16096ns = capped at 200px -->
+    <!-- residc: 52 + 16000 + 39 = 16091ns, capped at 200px -->
     <rect x="0" y="388" width="200" height="14" fill="#2980b9" rx="2"/>
     <text x="555" y="383" class="bar-label">48 us</text>
     <text x="165" y="399" class="bar-label-dark">16 us</text>
     <text x="265" y="391" class="winner" fill="#2980b9">residc 3x faster</text>
   </g>
 
-  <!-- Legend -->
-  <g transform="translate(540, 68)">
-    <rect x="0" y="0" width="12" height="12" fill="#e74c3c" rx="2"/>
-    <text x="18" y="11" class="legend-text">SBE (no compression, ~25 ns encode)</text>
-    <rect x="0" y="20" width="12" height="12" fill="#2980b9" rx="2"/>
-    <text x="18" y="31" class="legend-text">residc (3x compression, ~50 ns encode)</text>
-  </g>
-
   <!-- Bottom note -->
-  <text x="400" y="490" text-anchor="middle" class="subtitle">Wire time = message_size * 8 / link_speed. SBE sends raw; residc sends ~3x smaller.</text>
+  <text x="400" y="540" text-anchor="middle" class="subtitle">Wire time = message_size * 8 / link_speed. SBE sends raw; residc sends ~3x smaller.</text>
 </svg>
