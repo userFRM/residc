@@ -2,35 +2,22 @@
 
 **Schema-driven, per-message prediction-residual compression for financial data.**
 
-residc compresses financial messages (quotes, orders, trades) **2-3x** by predicting each field from context and encoding only the prediction error. Unlike general-purpose compressors (LZ4, zstd), it works on individual messages -- no blocks, no buffering, per-message random access.
+residc compresses financial messages (quotes, orders, trades) **~2x** by predicting each field from context and encoding only the prediction error. Unlike general-purpose compressors (LZ4, zstd), it works on individual messages -- no blocks, no buffering, per-message random access.
 
 Structure-agnostic: you define any message struct, map fields to prediction types, and the codec handles the rest.
 
 ## Benchmarks
 
-### Compression
+100K synthetic messages per type, gcc -O2, `-march=native`, best of 10 iterations. Reproducible: `cc -O2 -march=native -o bench_compression bench/bench_compression.c core/residc.c -Icore && ./bench_compression`
 
-```
-                Raw    Compressed   Ratio    Errors
-Quotes        27.0 B   11.6 B     2.34:1      0     (100K synthetic quotes)
-Orders        43.7 B   13.4 B     3.26:1      0     (2M synthetic order flow)
-```
+| Message | Fields | Raw | Compressed | Ratio | Encode | Decode |
+|---------|--------|-----|------------|-------|--------|--------|
+| **Quote** (bid/ask update) | 5 | 19 B | 8.2 B | **2.32:1** | 56 ns | 45 ns |
+| **Trade** (execution report) | 8 | 35 B | 17.7 B | **1.97:1** | 99 ns | 74 ns |
+| **Order** (new order single) | 10 | 34 B | 14.7 B | **2.31:1** | 105 ns | 82 ns |
+| **Book Update** (L2 depth) | 7 | 21 B | 10.1 B | **2.08:1** | 73 ns | 56 ns |
 
-#### External Benchmarks (not reproducible from this repo)
-
-```
-                Raw    Compressed   Ratio    Errors
-ITCH 5.0      32.2 B    9.9 B     3.27:1      0     (8M real NASDAQ messages)
-```
-
-### Latency
-
-|  | C core (gcc -O2, best of 10) |
-|--|------------------------------|
-| Encode | **51 ns/msg** |
-| Decode | **39 ns/msg** |
-
-Measured on 5-field synthetic quotes (100K messages), `clock_gettime` best-of-10, `-march=native`. The Rust and Python SDKs add FFI call overhead (~40-70ns) on top of the C core.
+Zero roundtrip errors across all message types. Language SDKs (Rust, Python) add FFI call overhead (~40-70ns) on top of the C core.
 
 ## When to Use residc
 
@@ -38,7 +25,7 @@ residc fills the gap between zero-copy serializers (SBE, rkyv, Cap'n Proto) that
 
 | Codec | Ratio | Encode | Decode | Per-msg |
 |-------|-------|--------|--------|---------|
-| **residc** | **2-3:1** | **51 ns** | **39 ns** | Yes |
+| **residc** | **2-2.3:1** | **56 ns** | **45 ns** | Yes |
 | SBE / rkyv / Cap'n Proto | 1.0:1 | ~10-25 ns | ~0 ns | Yes |
 | Protobuf | ~1.3:1 | ~100 ns | ~80 ns | Yes |
 | LZ4 (per-msg) | ~1.0:1 | ~50 ns | ~30 ns | Yes |

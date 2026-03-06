@@ -13,11 +13,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build benchmark
-        run: cc -O2 -Wall -Wextra -o bench_quote bench/bench_quote.c core/residc.c -Icore
+      - name: Build benchmarks
+        run: |
+          cc -O2 -Wall -Wextra -o bench_quote bench/bench_quote.c core/residc.c -Icore
+          cc -O2 -Wall -Wextra -o bench_compression bench/bench_compression.c core/residc.c -Icore
 
-      - name: Run benchmark (verify correctness)
-        run: ./bench_quote
+      - name: Run benchmarks (verify correctness)
+        run: |
+          ./bench_quote
+          ./bench_compression
 
       - name: Build SDK
         run: make -C sdk
